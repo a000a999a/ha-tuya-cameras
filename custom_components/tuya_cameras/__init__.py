@@ -51,10 +51,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     recipients = entry.options.get(CONF_RECIPIENTS, {})
 
-    # Retrieve UID from core device list for MQTT credentials
-    devices = (core_coord.data or {}).get("devices", [])
-    uid     = next((d.get("uid", "") for d in devices if d.get("uid")), "")
+    # UID stored in core config entry — set during core setup, editable via core options flow
+    uid       = core.get("uid", "")
     access_id = core["api"]._api_key
+
+    if not uid:
+        _LOGGER.warning(
+            "Tuya UID not set — MQTT bridge disabled. "
+            "Go to Tuya Home Core → Configure and save to trigger auto-detection."
+        )
 
     bridge = TuyaMQTTBridge(
         hass        = hass,
