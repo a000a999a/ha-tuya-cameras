@@ -61,6 +61,7 @@ class TuyaMQTTBridge:
 
     async def _run(self) -> None:
         _LOGGER.info("Tuya MQTT bridge starting")
+        reconnect_delay = 5  # seconds between reconnects after a drop
         while True:
             try:
                 creds = await self._hass.async_add_executor_job(self._fetch_creds)
@@ -73,12 +74,13 @@ class TuyaMQTTBridge:
                 refresh_at = time.monotonic() + expire_s - RECONNECT_BUFFER_S
                 key        = creds["password"][8:24].encode()   # AES-128-ECB session key
 
+                loop = asyncio.get_event_loop()
+                disconnect_event = asyncio.Event()
+
                 client = await self._hass.async_add_executor_job(self._connect, creds)
                 if client is None:
                     await asyncio.sleep(RETRY_DELAY_S)
                     continue
-
-                loop = asyncio.get_event_loop()
 
                 def on_message(c, userdata, msg):
                     asyncio.run_coroutine_threadsafe(
@@ -86,18 +88,24 @@ class TuyaMQTTBridge:
                     )
 
                 def on_disconnect(c, userdata, *args):
-                    _LOGGER.warning("MQTT disconnected")
+                    _LOGGER.warning("MQTT disconnected — will reconnect in %ds", reconnect_delay)
+                    loop.call_soon_threadsafe(disconnect_event.set)
 
                 client.on_message    = on_message
                 client.on_disconnect = on_disconnect
 
                 _LOGGER.info("MQTT bridge connected. Creds expire in %ds", expire_s)
 
-                while time.monotonic() < refresh_at:
-                    if not client.is_connected():
-                        _LOGGER.warning("MQTT connection lost — reconnecting")
-                        break
-                    await asyncio.sleep(10)
+                # Wait for disconnect signal or credential expiry
+                cred_timeout = refresh_at - time.monotonic()
+                try:
+                    await asyncio.wait_for(disconnect_event.wait(), timeout=cred_timeout)
+                    # Disconnected — wait briefly then reconnect with same creds
+                    await self._hass.async_add_executor_job(self._disconnect, client)
+                    await asyncio.sleep(reconnect_delay)
+                    continue
+                except asyncio.TimeoutError:
+                    pass  # Credentials about to expire — fall through to refresh
 
                 await self._hass.async_add_executor_job(self._disconnect, client)
                 _LOGGER.info("Refreshing MQTT credentials")
@@ -153,8 +161,9 @@ class TuyaMQTTBridge:
                 client = mqtt.Client(
                     client_id=creds["client_id"],
                     callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+                    reconnect_on_failure=False,
                 )
-            except AttributeError:
+            except (AttributeError, TypeError):
                 client = mqtt.Client(client_id=creds["client_id"])
 
             client.username_pw_set(creds["username"], creds["password"])
