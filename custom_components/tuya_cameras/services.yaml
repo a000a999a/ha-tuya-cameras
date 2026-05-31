@@ -1,0 +1,15 @@
+refresh_status:
+  name: Refresh Camera Status
+  description: Re-fetches SD card and online status for all cameras immediately.
+
+format_sd:
+  name: Format SD Card
+  description: Triggers an SD card format on the specified camera.
+  fields:
+    device_id:
+      name: Device ID
+      description: Tuya device ID of the camera to format.
+      required: true
+      example: "bf0bcfebd4df15eb95wkbm"
+      selector:
+        text: {}

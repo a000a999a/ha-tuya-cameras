@@ -1,0 +1,16 @@
+{
+  "domain": "tuya_cameras",
+  "name": "Tuya Cameras",
+  "version": "0.1.0",
+  "documentation": "https://github.com/a000a999a/ha-tuya-cameras",
+  "issue_tracker": "https://github.com/a000a999a/ha-tuya-cameras/issues",
+  "requirements": [
+    "tinytuya>=1.15.0",
+    "paho-mqtt>=1.6.1",
+    "cryptography>=41.0.0"
+  ],
+  "dependencies": ["tuya_home_core"],
+  "codeowners": ["@a000a999a"],
+  "iot_class": "cloud_push",
+  "config_flow": true
+}

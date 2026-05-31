@@ -1,0 +1,67 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Select Tuya Account",
+        "data": { "core_entry_id": "Tuya Home Core account" }
+      },
+      "smtp": {
+        "title": "Email / SMTP Settings",
+        "description": "Alerts are sent via this SMTP account. Gmail: use an App Password, not your login password.",
+        "data": {
+          "smtp_host":     "SMTP host",
+          "smtp_port":     "SMTP port",
+          "smtp_sender":   "Sender email address",
+          "smtp_password": "SMTP password / App Password"
+        }
+      },
+      "area_recipients": {
+        "title": "Recipients — {area}",
+        "description": "Separate multiple addresses with semicolons. Leave blank to disable alerts for this area.",
+        "data": {
+          "human": "Human alert recipients (motion detected)",
+          "tech":  "Tech alert recipients (SD card, camera offline)"
+        }
+      }
+    },
+    "abort": {
+      "no_core_entry": "Tuya Home Core is not installed. Install and configure it first.",
+      "no_areas":      "No areas found. Check that your Tuya cameras are assigned to homes in the SmartLife app."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Camera Settings",
+        "menu_options": {
+          "edit_smtp":       "Update SMTP / email settings",
+          "edit_recipients": "Edit area recipients"
+        }
+      },
+      "edit_smtp": {
+        "title": "SMTP Settings",
+        "data": {
+          "smtp_host":     "SMTP host",
+          "smtp_port":     "SMTP port",
+          "smtp_sender":   "Sender email address",
+          "smtp_password": "SMTP password / App Password"
+        }
+      },
+      "edit_recipients": {
+        "title": "Select Area",
+        "data": { "area": "Area to configure" }
+      },
+      "edit_area": {
+        "title": "Recipients — {area}",
+        "description": "Separate multiple addresses with semicolons.",
+        "data": {
+          "human": "Human alert recipients",
+          "tech":  "Tech alert recipients"
+        }
+      }
+    },
+    "abort": {
+      "no_areas": "No areas found in coordinator data."
+    }
+  }
+}
