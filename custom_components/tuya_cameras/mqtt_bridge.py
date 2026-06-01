@@ -328,8 +328,9 @@ class TuyaMQTTBridge:
             _LOGGER.info("Motion alert sent for %s/%s to %s", area, name, to_addrs)
 
     def _get_recipients(self, area: str, kind: str) -> list[str]:
+        import re
         raw = self._recipients_cfg.get(area, {}).get(kind, "")
-        return [r.strip() for r in raw.split(";") if r.strip()]
+        return [r.strip() for r in re.split(r"[;,]", raw) if r.strip()]
 
     @staticmethod
     def _decrypt(data: Any, key: bytes) -> dict:
