@@ -7,7 +7,10 @@ from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResu
 from homeassistant.core import callback
 from homeassistant.helpers import selector
 
+from .ai_client import AIClient
 from .const import (
+    CONF_AI_ENABLED,
+    CONF_AI_URL,
     CONF_CORE_ENTRY_ID,
     CONF_HUMAN_RECIPIENTS,
     CONF_RECIPIENTS,
@@ -18,6 +21,7 @@ from .const import (
     CONF_SMTP_PORT,
     CONF_SMTP_SENDER,
     CONF_TECH_RECIPIENTS,
+    DEFAULT_AI_URL,
     DEFAULT_REFRESH_DAYS,
     DEFAULT_SD_ALERT_THRESHOLD,
     DEFAULT_SMTP_HOST,
@@ -161,14 +165,15 @@ class TuyaCamerasOptionsFlow(OptionsFlow):
     async def async_step_init(self, user_input: dict | None = None) -> ConfigFlowResult:
         return self.async_show_menu(
             step_id="init",
-            menu_options=["edit_smtp", "edit_recipients", "edit_settings"],
+            menu_options=["edit_smtp", "edit_recipients", "edit_settings", "edit_ai"],
         )
 
     async def async_step_edit_settings(self, user_input: dict | None = None) -> ConfigFlowResult:
         if user_input is not None:
             new_options = {
-                CONF_RECIPIENTS:        self._recipients,
-                CONF_REFRESH_DAYS:      int(user_input[CONF_REFRESH_DAYS]),
+                **self._entry.options,
+                CONF_RECIPIENTS:         self._recipients,
+                CONF_REFRESH_DAYS:       int(user_input[CONF_REFRESH_DAYS]),
                 CONF_SD_ALERT_THRESHOLD: int(user_input[CONF_SD_ALERT_THRESHOLD]),
             }
             return self.async_create_entry(data=new_options)
@@ -195,7 +200,7 @@ class TuyaCamerasOptionsFlow(OptionsFlow):
         if user_input is not None:
             new_data = {**self._entry.data, **user_input, CONF_SMTP_PORT: int(user_input[CONF_SMTP_PORT])}
             self.hass.config_entries.async_update_entry(self._entry, data=new_data)
-            return self.async_create_entry(data={CONF_RECIPIENTS: self._recipients})
+            return self.async_create_entry(data={**self._entry.options, CONF_RECIPIENTS: self._recipients})
 
         defaults = {k: self._entry.data.get(k) for k in (
             CONF_SMTP_HOST, CONF_SMTP_PORT, CONF_SMTP_SENDER, CONF_SMTP_PASSWORD
@@ -238,10 +243,38 @@ class TuyaCamerasOptionsFlow(OptionsFlow):
                 CONF_HUMAN_RECIPIENTS: user_input.get(CONF_HUMAN_RECIPIENTS, ""),
                 CONF_TECH_RECIPIENTS:  user_input.get(CONF_TECH_RECIPIENTS, ""),
             }
-            return self.async_create_entry(data={CONF_RECIPIENTS: self._recipients})
+            return self.async_create_entry(data={**self._entry.options, CONF_RECIPIENTS: self._recipients})
 
         return self.async_show_form(
             step_id="edit_area",
             data_schema=_area_schema(area, self._recipients.get(area, {})),
             description_placeholders={"area": area},
+        )
+
+    async def async_step_edit_ai(self, user_input: dict | None = None) -> ConfigFlowResult:
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            enabled = user_input.get(CONF_AI_ENABLED, False)
+            url     = user_input.get(CONF_AI_URL, "").strip()
+            if enabled and url:
+                if not await AIClient(url).health_check():
+                    errors[CONF_AI_URL] = "ai_unreachable"
+            if not errors:
+                new_options = {
+                    **self._entry.options,
+                    CONF_RECIPIENTS:  self._recipients,
+                    CONF_AI_ENABLED:  enabled,
+                    CONF_AI_URL:      url,
+                }
+                return self.async_create_entry(data=new_options)
+
+        current_enabled = self._entry.options.get(CONF_AI_ENABLED, False)
+        current_url     = self._entry.options.get(CONF_AI_URL, DEFAULT_AI_URL)
+        schema = vol.Schema({
+            vol.Optional(CONF_AI_ENABLED, default=current_enabled):
+                selector.BooleanSelector(),
+            vol.Optional(CONF_AI_URL, default=current_url): str,
+        })
+        return self.async_show_form(
+            step_id="edit_ai", data_schema=schema, errors=errors
         )

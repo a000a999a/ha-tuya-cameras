@@ -1,8 +1,15 @@
 """
-Real-time Tuya MQTT bridge — listens for motion events and sends email alerts.
-Runs as a long-lived async HA background task. No YOLO — all motion triggers email.
+Real-time Tuya MQTT bridge — listens for motion events, optionally filters via
+AI human detection, then sends email alerts.
 Reconnects automatically 10 minutes before MQTT credentials expire (~2h TTL).
 AES-128-ECB key = mqtt_password[8:24] (session-specific).
+
+AI mode (ai_client is not None):
+  image present → infer → human: email annotated image / other: discard
+  image absent  → discard silently
+  service error → fail-open: email with original image
+
+Non-AI mode: all motion events trigger email as before.
 """
 
 from __future__ import annotations
@@ -15,7 +22,10 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from .ai_client import AIClient
+from .ai_stats import AIStats
 from .camera_api import CameraAPI
+from .const import EVENT_AI_UPDATED
 from .notify import Notifier
 
 _LOGGER = logging.getLogger(__name__)
@@ -36,6 +46,8 @@ class TuyaMQTTBridge:
         recipients_cfg: dict,
         uid: str,
         access_id: str,
+        ai_client: AIClient | None = None,
+        ai_stats: AIStats | None = None,
     ) -> None:
         self._hass           = hass
         self._tuya_client    = tuya_client
@@ -44,6 +56,8 @@ class TuyaMQTTBridge:
         self._recipients_cfg = recipients_cfg  # {area: {human: "...", tech: "..."}}
         self._uid            = uid
         self._access_id      = access_id
+        self._ai_client      = ai_client   # None = AI disabled
+        self._ai_stats       = ai_stats
         self._task: asyncio.Task | None = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -252,14 +266,47 @@ class TuyaMQTTBridge:
                 _LOGGER.debug("Motion %s/%s: OSS image ok (age %.0fs)", area, name, age_s)
 
         if not img_bytes:
-            _LOGGER.debug("Motion %s/%s: no OSS image, sending alert without image", area, name)
+            _LOGGER.debug("Motion %s/%s: no OSS image", area, name)
 
         ev_ts = datetime.fromtimestamp(t_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        # ── AI filtering ──────────────────────────────────────────────────────
+        email_image = img_bytes  # may be replaced with annotated image
+
+        if self._ai_client is not None:
+            if not img_bytes:
+                _LOGGER.debug("Motion %s/%s: AI enabled, no image — discarding", area, name)
+                return
+
+            ai_result = await self._ai_client.analyze(img_bytes)
+
+            if ai_result is None:
+                # Service unreachable or timed out — fail-open, email original image
+                _LOGGER.warning("Motion %s/%s: AI service unavailable — failing open", area, name)
+            elif not ai_result["human"]:
+                _LOGGER.debug(
+                    "Motion %s/%s: no human detected (conf=%.2f) — discarding",
+                    area, name, ai_result["confidence"],
+                )
+                if self._ai_stats:
+                    await self._ai_stats.async_record(human=False, area=area, camera=name)
+                    self._hass.bus.async_fire(EVENT_AI_UPDATED)
+                return
+            else:
+                _LOGGER.info(
+                    "Motion %s/%s: human detected (conf=%.2f) — alerting",
+                    area, name, ai_result["confidence"],
+                )
+                if self._ai_stats:
+                    await self._ai_stats.async_record(human=True, area=area, camera=name)
+                    self._hass.bus.async_fire(EVENT_AI_UPDATED)
+                email_image = ai_result.get("annotated_image", img_bytes)
+        # ─────────────────────────────────────────────────────────────────────
+
         snap_row = (
             f'<tr><td><b>Note</b></td><td style="color:#e67e22;">{snap_note}</td></tr>'
             if snap_note else ""
         )
-
         subject = f"Motion detected — {area} / {name}"
         body    = f"""<html><body>
 <h2 style="color:#c0392b;">Motion Detected</h2>
@@ -269,14 +316,14 @@ class TuyaMQTTBridge:
   <tr><td><b>Time</b></td><td>{ev_ts}</td></tr>
   {snap_row}
 </table>
-{'<br><img src="cid:motion_image" style="max-width:640px; border:1px solid #ccc;">' if img_bytes else ''}
+{'<br><img src="cid:motion_image" style="max-width:640px; border:1px solid #ccc;">' if email_image else ''}
 <br><p>Check your recording in the camera app.</p>
 </body></html>"""
 
         to_addrs = self._get_recipients(area, "human")
         if to_addrs:
             await self._hass.async_add_executor_job(
-                self._notifier.send, subject, body, to_addrs, img_bytes
+                self._notifier.send, subject, body, to_addrs, email_image
             )
             _LOGGER.info("Motion alert sent for %s/%s to %s", area, name, to_addrs)
 

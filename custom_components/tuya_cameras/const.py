@@ -41,3 +41,9 @@ DEFAULT_REFRESH_DAYS = 14
 # SMTP defaults
 DEFAULT_SMTP_HOST = "smtp.gmail.com"
 DEFAULT_SMTP_PORT = 587
+
+# AI detection
+CONF_AI_ENABLED = "ai_detection_enabled"
+CONF_AI_URL     = "ai_detection_url"
+DEFAULT_AI_URL  = "http://localhost:8000"
+EVENT_AI_UPDATED = f"{DOMAIN}_ai_updated"

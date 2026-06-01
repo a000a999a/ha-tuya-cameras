@@ -8,8 +8,11 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 
+from .ai_client import AIClient
+from .ai_stats import AIStats
 from .camera_api import CameraAPI
 from .const import (
+    CONF_AI_ENABLED, CONF_AI_URL,
     CONF_CORE_ENTRY_ID, CONF_RECIPIENTS, CONF_REFRESH_DAYS, DEFAULT_REFRESH_DAYS,
     CONF_SMTP_HOST, CONF_SMTP_PASSWORD, CONF_SMTP_PORT, CONF_SMTP_SENDER,
     DOMAIN, DOMAIN_CORE,
@@ -58,6 +61,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "Go to Tuya Home Core → Configure and save to trigger auto-detection."
         )
 
+    ai_enabled = entry.options.get(CONF_AI_ENABLED, False)
+    ai_url     = entry.options.get(CONF_AI_URL, "")
+    ai_client  = AIClient(ai_url) if ai_enabled and ai_url else None
+    ai_stats   = AIStats(hass, entry.entry_id)
+    await ai_stats.async_load()
+
+    if ai_client:
+        _LOGGER.info("AI detection enabled, service: %s", ai_url)
+
     bridge = TuyaMQTTBridge(
         hass           = hass,
         tuya_client    = tuya_client,
@@ -66,6 +78,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         recipients_cfg = recipients,
         uid            = uid,
         access_id      = access_id,
+        ai_client      = ai_client,
+        ai_stats       = ai_stats,
     )
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
@@ -74,6 +88,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "camera_api":   camera_api,
         "notifier":     notifier,
         "bridge":       bridge,
+        "ai_stats":     ai_stats,
     }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

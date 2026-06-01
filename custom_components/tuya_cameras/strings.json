@@ -36,7 +36,8 @@
         "menu_options": {
           "edit_smtp":       "Update SMTP / email settings",
           "edit_recipients": "Edit area recipients",
-          "edit_settings":   "Refresh interval & SD alert threshold"
+          "edit_settings":   "Refresh interval & SD alert threshold",
+          "edit_ai":         "AI human detection"
         }
       },
       "edit_settings": {
@@ -66,6 +67,17 @@
         "data": {
           "human": "Human alert recipients",
           "tech":  "Tech alert recipients"
+        }
+      },
+      "edit_ai": {
+        "title": "AI Human Detection",
+        "description": "When enabled, motion images are sent to the inference service. Only images where a human is detected trigger an email. Events without an image are discarded. If the service is unreachable the email is sent anyway (fail-open).",
+        "data": {
+          "ai_detection_enabled": "Enable AI human detection",
+          "ai_detection_url":     "Inference service URL (e.g. http://localhost:8000)"
+        },
+        "error": {
+          "ai_unreachable": "Cannot reach the inference service. Check the URL and that docker compose is running."
         }
       }
     },
