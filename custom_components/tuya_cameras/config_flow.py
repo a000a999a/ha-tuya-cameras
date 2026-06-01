@@ -11,11 +11,15 @@ from .const import (
     CONF_CORE_ENTRY_ID,
     CONF_HUMAN_RECIPIENTS,
     CONF_RECIPIENTS,
+    CONF_REFRESH_DAYS,
+    CONF_SD_ALERT_THRESHOLD,
     CONF_SMTP_HOST,
     CONF_SMTP_PASSWORD,
     CONF_SMTP_PORT,
     CONF_SMTP_SENDER,
     CONF_TECH_RECIPIENTS,
+    DEFAULT_REFRESH_DAYS,
+    DEFAULT_SD_ALERT_THRESHOLD,
     DEFAULT_SMTP_HOST,
     DEFAULT_SMTP_PORT,
     DOMAIN,
@@ -157,8 +161,35 @@ class TuyaCamerasOptionsFlow(OptionsFlow):
     async def async_step_init(self, user_input: dict | None = None) -> ConfigFlowResult:
         return self.async_show_menu(
             step_id="init",
-            menu_options=["edit_smtp", "edit_recipients"],
+            menu_options=["edit_smtp", "edit_recipients", "edit_settings"],
         )
+
+    async def async_step_edit_settings(self, user_input: dict | None = None) -> ConfigFlowResult:
+        if user_input is not None:
+            new_options = {
+                CONF_RECIPIENTS:        self._recipients,
+                CONF_REFRESH_DAYS:      int(user_input[CONF_REFRESH_DAYS]),
+                CONF_SD_ALERT_THRESHOLD: int(user_input[CONF_SD_ALERT_THRESHOLD]),
+            }
+            return self.async_create_entry(data=new_options)
+
+        current_refresh   = self._entry.options.get(CONF_REFRESH_DAYS, DEFAULT_REFRESH_DAYS)
+        current_threshold = self._entry.options.get(CONF_SD_ALERT_THRESHOLD, DEFAULT_SD_ALERT_THRESHOLD)
+        schema = vol.Schema({
+            vol.Optional(CONF_REFRESH_DAYS, default=current_refresh):
+                selector.NumberSelector(selector.NumberSelectorConfig(
+                    min=1, max=30, step=1,
+                    mode=selector.NumberSelectorMode.SLIDER,
+                    unit_of_measurement="days",
+                )),
+            vol.Optional(CONF_SD_ALERT_THRESHOLD, default=current_threshold):
+                selector.NumberSelector(selector.NumberSelectorConfig(
+                    min=50, max=99, step=1,
+                    mode=selector.NumberSelectorMode.SLIDER,
+                    unit_of_measurement="%",
+                )),
+        })
+        return self.async_show_form(step_id="edit_settings", data_schema=schema)
 
     async def async_step_edit_smtp(self, user_input: dict | None = None) -> ConfigFlowResult:
         if user_input is not None:

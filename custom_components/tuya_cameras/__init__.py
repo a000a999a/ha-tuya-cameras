@@ -5,14 +5,12 @@ from __future__ import annotations
 import logging
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
-import voluptuous as vol
-from homeassistant.helpers import config_validation as cv
 
 from .camera_api import CameraAPI
 from .const import (
-    CONF_CORE_ENTRY_ID, CONF_RECIPIENTS,
+    CONF_CORE_ENTRY_ID, CONF_RECIPIENTS, CONF_REFRESH_DAYS, DEFAULT_REFRESH_DAYS,
     CONF_SMTP_HOST, CONF_SMTP_PASSWORD, CONF_SMTP_PORT, CONF_SMTP_SENDER,
     DOMAIN, DOMAIN_CORE,
 )
@@ -40,9 +38,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         CONF_SMTP_SENDER:   entry.data[CONF_SMTP_SENDER],
         CONF_SMTP_PASSWORD: entry.data[CONF_SMTP_PASSWORD],
     }
-    notifier   = Notifier(smtp_config)
-    camera_api = CameraAPI(tuya_client)
-    coordinator = CameraCoordinator(hass, camera_api, core_coord)
+    notifier     = Notifier(smtp_config)
+    camera_api   = CameraAPI(tuya_client)
+    refresh_days = entry.options.get(CONF_REFRESH_DAYS, DEFAULT_REFRESH_DAYS)
+    coordinator  = CameraCoordinator(hass, camera_api, core_coord, refresh_days)
 
     try:
         await coordinator.async_config_entry_first_refresh()
@@ -50,10 +49,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise ConfigEntryNotReady(f"Camera status unavailable: {err}") from err
 
     recipients = entry.options.get(CONF_RECIPIENTS, {})
-
-    # UID stored in core config entry — set during core setup, editable via core options flow
-    uid       = core.get("uid", "")
-    access_id = core["api"]._api_key
+    uid        = core.get("uid", "")
+    access_id  = core["api"]._api_key
 
     if not uid:
         _LOGGER.warning(
@@ -62,20 +59,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     bridge = TuyaMQTTBridge(
-        hass        = hass,
-        tuya_client = tuya_client,
-        camera_api  = camera_api,
-        notifier    = notifier,
+        hass           = hass,
+        tuya_client    = tuya_client,
+        camera_api     = camera_api,
+        notifier       = notifier,
         recipients_cfg = recipients,
-        uid         = uid,
-        access_id   = access_id,
+        uid            = uid,
+        access_id      = access_id,
     )
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
-        "coordinator": coordinator,
-        "camera_api":  camera_api,
-        "notifier":    notifier,
-        "bridge":      bridge,
+        "coordinator":  coordinator,
+        "core_coord":   core_coord,
+        "camera_api":   camera_api,
+        "notifier":     notifier,
+        "bridge":       bridge,
     }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -83,8 +81,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     bridge.start(hass)
     _LOGGER.info(
-        "Tuya Cameras loaded: %d camera(s)",
+        "Tuya Cameras loaded: %d camera(s), refresh every %d day(s)",
         len((coordinator.data or {}).get("cameras", {})),
+        refresh_days,
     )
     return True
 

@@ -31,10 +31,12 @@ SD_STATUS_LABELS = {
     "4": "format failed",
     "5": "no card",
 }
-SD_THRESHOLD_DEFAULT = 90  # percent
+CONF_SD_ALERT_THRESHOLD = "sd_alert_threshold"
+DEFAULT_SD_ALERT_THRESHOLD = 90  # percent — alert when SD usage exceeds this
 
-# Coordinator
-COORDINATOR_UPDATE_INTERVAL_MINUTES = 15
+# Coordinator refresh
+CONF_REFRESH_DAYS    = "refresh_days"
+DEFAULT_REFRESH_DAYS = 14
 
 # SMTP defaults
 DEFAULT_SMTP_HOST = "smtp.gmail.com"

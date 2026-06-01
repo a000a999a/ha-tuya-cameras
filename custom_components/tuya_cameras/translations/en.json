@@ -35,7 +35,16 @@
         "title": "Camera Settings",
         "menu_options": {
           "edit_smtp":       "Update SMTP / email settings",
-          "edit_recipients": "Edit area recipients"
+          "edit_recipients": "Edit area recipients",
+          "edit_settings":   "Refresh interval & SD alert threshold"
+        }
+      },
+      "edit_settings": {
+        "title": "Refresh & Alert Settings",
+        "description": "Controls how often camera data is pulled automatically. Use the Refresh button for on-demand updates.",
+        "data": {
+          "refresh_days":       "Auto-refresh interval (days)",
+          "sd_alert_threshold": "SD card alert threshold (%)"
         }
       },
       "edit_smtp": {

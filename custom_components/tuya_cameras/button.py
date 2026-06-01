@@ -1,4 +1,8 @@
-"""Format SD card button — one per camera."""
+"""Button entities for Tuya Cameras.
+
+- RefreshButton (1 per integration): refreshes core device list then camera SD status.
+- FormatSDButton (1 per camera): formats the SD card on a specific camera.
+"""
 
 from __future__ import annotations
 
@@ -24,17 +28,55 @@ async def async_setup_entry(
 ) -> None:
     data        = hass.data[DOMAIN][entry.entry_id]
     coordinator = data["coordinator"]
+    core_coord  = data["core_coord"]
     camera_api  = data["camera_api"]
     cameras     = (coordinator.data or {}).get("cameras", {})
 
-    async_add_entities([
-        FormatSDButton(entry, dev_id, cam, camera_api)
-        for dev_id, cam in cameras.items()
-    ])
+    entities: list[ButtonEntity] = [
+        RefreshButton(entry, core_coord, coordinator),
+        *[
+            FormatSDButton(entry, dev_id, cam, camera_api)
+            for dev_id, cam in cameras.items()
+        ],
+    ]
+    async_add_entities(entities)
+
+
+class RefreshButton(ButtonEntity):
+    """
+    Central refresh: sequentially refreshes the core device list then camera SD status.
+    One button for all cameras — use this to pick up new/changed devices or fresh SD data.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name            = "Refresh"
+    _attr_icon            = "mdi:refresh"
+
+    def __init__(
+        self,
+        entry: ConfigEntry,
+        core_coordinator: any,
+        cam_coordinator: CameraCoordinator,
+    ) -> None:
+        self._core_coord     = core_coordinator
+        self._cam_coord      = cam_coordinator
+        self._attr_unique_id = f"{entry.entry_id}_refresh"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name="Tuya Cameras",
+            manufacturer="Tuya",
+        )
+
+    async def async_press(self) -> None:
+        _LOGGER.info("Manual refresh: pulling device list from Tuya Cloud...")
+        await self._core_coord.async_refresh()
+        _LOGGER.info("Manual refresh: updating camera SD status...")
+        await self._cam_coord.async_refresh()
+        _LOGGER.info("Manual refresh complete")
 
 
 class FormatSDButton(ButtonEntity):
-    """Triggers an SD card format on the camera via Tuya API."""
+    """Triggers an SD card format on one specific camera via Tuya API."""
 
     _attr_has_entity_name = True
     _attr_name            = "Format SD Card"
