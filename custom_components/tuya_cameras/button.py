@@ -15,8 +15,9 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .camera_api import CameraAPI
-from .const import DOMAIN
+from .const import CONF_RECIPIENTS, CONF_TECH_RECIPIENTS, DOMAIN
 from .coordinator import CameraCoordinator
+from .notify import Notifier
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -30,10 +31,12 @@ async def async_setup_entry(
     coordinator = data["coordinator"]
     core_coord  = data["core_coord"]
     camera_api  = data["camera_api"]
+    notifier    = data["notifier"]
     cameras     = (coordinator.data or {}).get("cameras", {})
 
     entities: list[ButtonEntity] = [
         RefreshButton(entry, core_coord, coordinator),
+        TestMailerButton(entry, notifier),
         *[
             FormatSDButton(entry, dev_id, cam, camera_api)
             for dev_id, cam in cameras.items()
@@ -73,6 +76,52 @@ class RefreshButton(ButtonEntity):
         _LOGGER.info("Manual refresh: updating camera SD status...")
         await self._cam_coord.async_refresh()
         _LOGGER.info("Manual refresh complete")
+
+
+class TestMailerButton(ButtonEntity):
+    """Sends a test email to the tech recipient of every configured area."""
+
+    _attr_has_entity_name = True
+    _attr_name            = "Test Mailer"
+    _attr_icon            = "mdi:email-check"
+
+    def __init__(self, entry: ConfigEntry, notifier: Notifier) -> None:
+        self._entry    = entry
+        self._notifier = notifier
+        self._attr_unique_id = f"{entry.entry_id}_test_mailer"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name="Tuya Cameras",
+            manufacturer="Tuya",
+        )
+
+    async def async_press(self) -> None:
+        from datetime import datetime
+        now        = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        recipients = self._entry.options.get(CONF_RECIPIENTS, {})
+
+        for area, addr_map in recipients.items():
+            tech_addrs = [
+                a.strip()
+                for a in addr_map.get(CONF_TECH_RECIPIENTS, "").split(",")
+                if a.strip()
+            ]
+            if not tech_addrs:
+                _LOGGER.warning("Test mailer: no tech recipients for area %s", area)
+                continue
+
+            subject = f"[TEST] Tuya Cameras — {area}"
+            body = (
+                "<html><body>"
+                f"<h2>Test notification — {area}</h2>"
+                f"<p>Sent: {now}</p>"
+                f"<p>SMTP is working correctly for area <b>{area}</b>.</p>"
+                "</body></html>"
+            )
+            await self.hass.async_add_executor_job(
+                self._notifier.send, subject, body, tech_addrs
+            )
+            _LOGGER.info("Test email sent to %s for area %s", tech_addrs, area)
 
 
 class FormatSDButton(ButtonEntity):
