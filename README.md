@@ -1,38 +1,52 @@
 # Tuya Cameras
 
-Real-time motion alerts and SD card monitoring for Tuya IPC cameras in Home Assistant.
+Real-time motion alerts, SD card monitoring, and Format SD buttons for Tuya IPC cameras in Home Assistant.
 
-Connects to Tuya's MQTT broker for instant motion notifications. Monitors SD card
-usage on all cameras and alerts when cards approach full. Provides per-camera
-Format SD buttons directly in HA.
+Connects to Tuya's MQTT broker for instant push motion notifications. Works alongside
+the official **Tuya** HA integration — which provides live video streams — to give
+a complete camera dashboard with video, SD status, and email alerts.
+
+---
+
+## How the two Tuya systems work together
+
+| What you need | Where it comes from |
+|---|---|
+| Live video stream (`camera.xxx`) | Official **Tuya** integration (hub) |
+| SD card usage sensor | This integration (Tuya Cameras) |
+| Camera online/offline status | This integration (Tuya Cameras) |
+| Format SD Card button | This integration (Tuya Cameras) |
+| MQTT motion alert email | This integration (Tuya Cameras) |
+
+Both are required for a complete setup. See the
+[Tuya Home Core README](https://github.com/a000a999a/ha-tuya-home-core) for the
+full six-step setup guide starting from camera registration in SmartLife.
+
+---
 
 ## Prerequisites
 
 - **[Tuya Home Core](https://github.com/a000a999a/ha-tuya-home-core)** installed and configured
-- Tuya IPC cameras registered in your Tuya/SmartLife account
-- Cameras assigned to homes in the SmartLife app (used for area grouping)
+- **Official Tuya integration** configured in HA (for live video streams)
+- Tuya IPC cameras registered in SmartLife and assigned to homes
 - A Gmail account with an [App Password](https://support.google.com/accounts/answer/185833) (or any SMTP server)
 
 ## Installation via HACS
 
-1. Install **Tuya Home Core** first
+1. Complete the [full setup guide](https://github.com/a000a999a/ha-tuya-home-core#full-setup-guide) in Tuya Home Core first
 2. In HACS → Custom repositories, add `a000a999a/ha-tuya-cameras`
 3. Install **Tuya Cameras** and restart Home Assistant
 4. Go to **Settings → Devices & Services → Add Integration → Tuya Cameras**
 
 ## Multiple Tuya projects
 
-If your cameras are spread across more than one Tuya developer project (e.g. to stay within the 50-device limit), add a separate **Tuya Cameras** entry for each project:
-
-1. Add a **Tuya Home Core** entry for each Tuya project (give each a distinct Project label)
-2. Add a **Tuya Cameras** entry for each core entry
-
-Each Tuya Cameras entry runs its own MQTT bridge authenticated with that project's credentials, so motion events from all projects are received independently. SD monitoring and email alerts are also scoped per entry.
+If cameras are split across multiple Tuya developer projects (e.g. to stay under the 50-device limit), add one **Tuya Cameras** entry per project — each runs its own independent MQTT bridge. The **Refresh All Cameras** button covers all projects at once.
 
 ## Configuration
 
 ### Step 1 — Select Tuya account
-If only one Tuya Home Core entry exists, it is selected automatically. If multiple entries exist, a dropdown lists each one with its project label, areas, and device count to help distinguish them.
+
+If only one Tuya Home Core entry exists it is auto-selected. If multiple exist, a dropdown shows each entry with its project label, areas, and device count so you can distinguish them.
 
 ### Step 2 — SMTP settings
 
@@ -45,62 +59,73 @@ If only one Tuya Home Core entry exists, it is selected automatically. If multip
 
 ### Step 3+ — Recipients per area
 
-For each area discovered from your Tuya homes, configure:
+For each area (Tuya home name), configure:
 
 | Field | Description |
 |---|---|
-| Human alert recipients | Emails notified on motion (semicolon-separated) |
+| Human alert recipients | Emails notified on human motion (semicolon-separated) |
 | Tech alert recipients  | Emails notified for SD card alerts (semicolon-separated) |
 
 Leave blank to disable alerts for that area.
 
-### Updating settings
-Go to **Settings → Devices & Services → Tuya Cameras → Configure**.
+## Refresh All Cameras
+
+A single service call `tuya_cameras.refresh_all` refreshes all projects and updates
+the Lovelace Cameras view automatically. Add this button card to any dashboard:
+
+```yaml
+type: button
+name: Refresh All Cameras
+icon: mdi:refresh
+tap_action:
+  action: call-service
+  service: tuya_cameras.refresh_all
+```
+
+When pressed:
+1. Pulls the updated device list from each linked Tuya project
+2. Re-polls SD card status for all cameras
+3. Fills in entities (SD usage · Status · Format SD Card) for any picture-glance cards whose title matches a camera name
+
+If new cameras are discovered (not present before the refresh), the affected
+integration entry reloads automatically to create their entities.
 
 ## Features
 
 ### Real-time motion alerts
-The integration connects to Tuya's MQTT broker and receives motion events
-within seconds. For each event it attempts to download the motion thumbnail
-from Tuya OSS and includes it in the alert email.
+Connects to Tuya's MQTT broker (push, no polling). For each motion event, downloads
+the thumbnail from Tuya OSS and emails it. Falls back to an HA camera snapshot if
+OSS download fails.
 
 ### SD card monitoring
-Every 15 minutes, the integration polls SD card status for all cameras.
-A tech alert email is sent if any camera's SD usage reaches **90%**.
-The threshold is not currently configurable in the UI (raise an issue to request it).
+Polls SD status every 15 minutes. Sends a tech alert email when usage reaches 90%.
 
-### Format SD card
-Each camera gets a **Format SD Card** button in HA. Press to trigger an immediate
-format via the Tuya API.
+### Format SD Card
+One button per camera. Press to format via Tuya Cloud API — no confirmation prompt.
 
 ### Camera status sensors
-Each camera exposes:
-- `sensor.<name>_sd_usage` — SD usage percentage
+- `sensor.<name>_sd_usage` — SD usage %
 - `sensor.<name>_status` — online / offline
-
-## Human Detection (AI extension)
-
-AI-powered human detection using YOLOv8 is not included in this release but is
-fully documented. See **[docs/yolo_extension.md](docs/yolo_extension.md)**.
-
-## Supported camera categories
-
-`sp`, `ipc`, `dh`, `nvr`, `sp-new` — all standard Tuya IPC categories.
 
 ## Services
 
-| Service | Description |
-|---|---|
-| `tuya_cameras.refresh_status` | Force immediate status refresh |
-| `tuya_cameras.format_sd` | Format SD card by device ID |
+| Service | Scope | Description |
+|---|---|---|
+| `tuya_cameras.refresh_all` | All projects | Refresh device lists + SD status + update Lovelace |
+| `tuya_cameras.refresh_status` | Per entry | Re-poll SD status for that entry's cameras |
+| `tuya_cameras.format_sd` | Per camera | Format SD card by device ID |
 
 ## Troubleshooting
 
-**No cameras found:** Check that cameras are assigned to homes in the SmartLife app
-and that your Tuya API key has Smart Home API access enabled.
+**No cameras found:** Check cameras are assigned to Tuya homes in SmartLife and
+that the developer API project has Smart Home API access.
 
-**MQTT not connecting:** Ensure your Tuya project has MQTT/messaging API enabled
-on the iot.tuya.com project page.
+**MQTT not connecting:** Ensure MQTT/messaging API is enabled on iot.tuya.com and
+BizCode subscriptions are active.
 
-**Emails not sending:** Gmail requires an App Password — your regular password
-will not work. Enable 2FA first, then create an App Password.
+**Emails not sending:** Gmail requires an App Password — regular password won't work.
+Enable 2FA first, then create an App Password at myaccount.google.com.
+
+**Wallis / new cameras show no SD or status:** Press **Refresh All Cameras**. If still
+empty, the camera name in SmartLife must match the picture-glance card title exactly
+(case-insensitive) for automatic entity wiring.
