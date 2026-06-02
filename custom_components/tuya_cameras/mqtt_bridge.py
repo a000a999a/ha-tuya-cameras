@@ -64,6 +64,7 @@ class TuyaMQTTBridge:
         self._local_keys: dict[str, str] = {}    # device_id → local_key
         self._product_ids: dict[str, str] = {}  # device_id → product_id (for v4 blob decrypt)
         self._uuids: dict[str, str] = {}         # device_id → uuid
+        self._last_alert_ts: dict[str, float] = {}  # device_id → last alert timestamp
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -285,17 +286,14 @@ class TuyaMQTTBridge:
         if not motion_dps:
             return
 
-        core_data = self._hass.data.get("tuya_home_core", {})
+        # Use this bridge's own core coordinator — avoids wrong-project camera lookup
         cameras: dict = {}
-        for entry_data in core_data.values():
-            coord = entry_data.get("coordinator")
-            if coord and coord.data:
-                cam_api_data = self._camera_api.cameras_from_devices(
-                    coord.data.get("devices", []),
-                    coord.data.get("areas", {}),
-                )
-                cameras = {c["id"]: c for c in cam_api_data}
-                break
+        if self._core_coord and self._core_coord.data:
+            cam_list = self._camera_api.cameras_from_devices(
+                self._core_coord.data.get("devices", []),
+                self._core_coord.data.get("areas", {}),
+            )
+            cameras = {c["id"]: c for c in cam_list}
 
         cam = cameras.get(dev_id)
         if not cam:
@@ -422,8 +420,20 @@ class TuyaMQTTBridge:
 <br><p>Check your recording in the camera app.</p>
 </body></html>"""
 
+        # Per-camera cooldown — prevent alert spam from high-sensitivity cameras
+        ALERT_COOLDOWN_S = 300  # minimum 5 minutes between alerts per camera
+        now  = time.time()
+        last = self._last_alert_ts.get(dev_id, 0.0)
+        if now - last < ALERT_COOLDOWN_S:
+            _LOGGER.debug(
+                "Motion %s/%s: cooldown active (%.0fs remaining) — suppressing alert",
+                area, name, ALERT_COOLDOWN_S - (now - last),
+            )
+            return
+
         to_addrs = self._get_recipients(area, "human")
         if to_addrs:
+            self._last_alert_ts[dev_id] = now
             await self._hass.async_add_executor_job(
                 self._notifier.send, subject, body, to_addrs, email_image
             )
