@@ -142,99 +142,71 @@ class CameraAPI:
             return None
 
         for url in [
-            f"https://images.tuyaeu.com{file_path}",
+            f"https://images.tuyaeu.com/{bucket}{file_path}",
             f"https://{bucket}.oss-eu-central-1.aliyuncs.com{file_path}",
         ]:
             try:
                 r = requests.get(url, timeout=10)
+                _LOGGER.debug("OSS fetch %s → HTTP %d, %d bytes", url, r.status_code, len(r.content))
                 if r.status_code != 200 or not r.content:
                     continue
                 data = r.content
                 if data[:2] == b"\xff\xd8":
+                    _LOGGER.debug("OSS image is plain JPEG")
                     return data
                 if file_key:
                     decrypted = self._decrypt_image(data, file_key)
                     if decrypted:
+                        _LOGGER.debug("OSS image decrypted ok")
                         return decrypted
-            except Exception:
+                    _LOGGER.debug("OSS decrypt failed — magic=%r key_len=%d", data[:4], len(file_key))
+            except Exception as exc:
+                _LOGGER.debug("OSS fetch exception for %s: %s", url, exc)
                 continue
         return None
 
     @staticmethod
     def _decrypt_image(data: bytes, file_key: str) -> bytes | None:
+        # Uses `cryptography` (already in requirements) — NOT pycryptodome.
+        # Two formats seen in the wild:
+        #   ECB: raw AES-128-ECB ciphertext, PKCS#7 padded, no header
+        #   CBC: 4-byte version + 16-byte IV + 44-byte metadata + AES-128-CBC ciphertext
         try:
-            from Crypto.Cipher import AES
+            from cryptography.hazmat.backends import default_backend
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
             raw_key = (
                 bytes.fromhex(file_key) if len(file_key) == 32
                 else (file_key.encode() + b"\x00" * 16)[:16]
             )
-            dec = AES.new(raw_key, AES.MODE_ECB).decrypt(data)
-            pad = dec[-1]
-            if 1 <= pad <= 16:
-                dec = dec[:-pad]
-            return dec if dec[:2] == b"\xff\xd8" else None
-        except Exception:
+
+            # Try ECB (older cameras, most common)
+            try:
+                ctx = Cipher(algorithms.AES(raw_key), modes.ECB(), backend=default_backend()).decryptor()
+                dec = ctx.update(data) + ctx.finalize()
+                pad = dec[-1]
+                if 1 <= pad <= 16:
+                    dec = dec[:-pad]
+                if dec[:2] == b"\xff\xd8":
+                    return dec
+            except Exception:
+                pass
+
+            # Try CBC with 64-byte header: 4-byte version + 16-byte IV + 44-byte metadata
+            if len(data) > 64:
+                iv  = data[4:20]
+                enc = data[64:]
+                try:
+                    ctx = Cipher(algorithms.AES(raw_key), modes.CBC(iv), backend=default_backend()).decryptor()
+                    dec = ctx.update(enc) + ctx.finalize()
+                    pad = dec[-1]
+                    if 1 <= pad <= 16:
+                        dec = dec[:-pad]
+                    if dec[:2] == b"\xff\xd8":
+                        return dec
+                except Exception:
+                    pass
+
             return None
-
-    def get_ha_snapshot(self, entity_id: str) -> bytes | None:
-        """Fetch live camera snapshot from HA REST API."""
-        if not self._ha_token or not entity_id:
-            return None
-        try:
-            r = requests.get(
-                f"{self._ha_url}/api/camera_proxy/{entity_id}",
-                headers={"Authorization": f"Bearer {self._ha_token}"},
-                timeout=15,
-            )
-            if r.status_code == 200 and r.content:
-                return r.content
-        except Exception as err:
-            _LOGGER.debug("HA snapshot failed for %s: %s", entity_id, err)
-        return None
-
-    def get_motion_events(
-        self, device_id: str, start_ms: int, end_ms: int
-    ) -> list[dict]:
-        """Retrieve recent motion events via device logs."""
-        try:
-            result = self._client.getdevicelog(
-                device_id, start=start_ms, end=end_ms, size=50
-            )
-        except Exception as err:
-            _LOGGER.debug("getdevicelog error for %s: %s", device_id, err)
-            return []
-
-        logs = (result or {}).get("result", {}).get("logs", [])
-        events = []
-        for log in logs:
-            code = log.get("code", "")
-            if code not in ("initiative_message", "movement_detect_pic"):
-                continue
-            raw = log.get("value", "")
-            data = self._decode_event(raw)
-            if data is None:
-                continue
-            if code == "initiative_message" and data.get("cmd") != "ipc_motion":
-                continue
-            files     = data.get("files", [[]])
-            file_path = files[0][0] if files and files[0] else ""
-            file_key  = files[0][1] if files and files[0] and len(files[0]) > 1 else ""
-            events.append({
-                "alarm_time": log.get("event_time", 0),
-                "bucket":     data.get("bucket", ""),
-                "file_path":  file_path,
-                "file_key":   file_key,
-            })
-        return events
-
-    @staticmethod
-    def _decode_event(raw: str) -> dict | None:
-        import json
-        try:
-            return json.loads(raw)
-        except Exception:
-            pass
-        try:
-            return json.loads(base64.b64decode(raw + "==").decode("utf-8"))
         except Exception:
             return None

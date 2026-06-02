@@ -73,6 +73,17 @@ class TuyaCamerasConfigFlow(ConfigFlow, domain=DOMAIN):
         self._recipients: dict = {}
         self._area_index = 0
 
+    def _core_entry_label(self, entry) -> str:
+        """Build a descriptive label: title + areas + device count from coordinator."""
+        core_data = self.hass.data.get(DOMAIN_CORE, {}).get(entry.entry_id, {})
+        coord = core_data.get("coordinator")
+        if coord and coord.data:
+            areas = sorted({a for a in coord.data.get("areas", {}).values() if a})
+            n = len(coord.data.get("devices", []))
+            if areas:
+                return f"{entry.title} · {', '.join(areas)} ({n} devices)"
+        return entry.title
+
     async def async_step_user(self, user_input: dict | None = None) -> ConfigFlowResult:
         core_entries = self.hass.config_entries.async_entries(DOMAIN_CORE)
         if not core_entries:
@@ -89,7 +100,7 @@ class TuyaCamerasConfigFlow(ConfigFlow, domain=DOMAIN):
         schema = vol.Schema({
             vol.Required(CONF_CORE_ENTRY_ID): selector.SelectSelector(
                 selector.SelectSelectorConfig(options=[
-                    selector.SelectOptionDict(value=e.entry_id, label=e.title)
+                    selector.SelectOptionDict(value=e.entry_id, label=self._core_entry_label(e))
                     for e in core_entries
                 ])
             )

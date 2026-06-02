@@ -20,10 +20,19 @@ Format SD buttons directly in HA.
 3. Install **Tuya Cameras** and restart Home Assistant
 4. Go to **Settings → Devices & Services → Add Integration → Tuya Cameras**
 
+## Multiple Tuya projects
+
+If your cameras are spread across more than one Tuya developer project (e.g. to stay within the 50-device limit), add a separate **Tuya Cameras** entry for each project:
+
+1. Add a **Tuya Home Core** entry for each Tuya project (give each a distinct Project label)
+2. Add a **Tuya Cameras** entry for each core entry
+
+Each Tuya Cameras entry runs its own MQTT bridge authenticated with that project's credentials, so motion events from all projects are received independently. SD monitoring and email alerts are also scoped per entry.
+
 ## Configuration
 
 ### Step 1 — Select Tuya account
-Auto-selected if only one Tuya Home Core entry exists.
+If only one Tuya Home Core entry exists, it is selected automatically. If multiple entries exist, a dropdown lists each one with its project label, areas, and device count to help distinguish them.
 
 ### Step 2 — SMTP settings
 

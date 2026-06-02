@@ -1,3 +1,11 @@
+refresh_all:
+  name: Refresh All Cameras
+  description: >
+    Refreshes every Tuya Cameras entry — pulls the updated device list from
+    Tuya Cloud for each linked Home Core project, then re-polls SD card status
+    for all cameras across all projects. Use this after adding new cameras or
+    to force an immediate status update regardless of the coordinator schedule.
+
 refresh_status:
   name: Refresh Camera Status
   description: Re-fetches SD card and online status for all cameras immediately.

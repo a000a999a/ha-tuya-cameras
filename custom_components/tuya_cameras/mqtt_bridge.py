@@ -46,6 +46,7 @@ class TuyaMQTTBridge:
         recipients_cfg: dict,
         uid: str,
         access_id: str,
+        core_coord: Any = None,
         ai_client: AIClient | None = None,
         ai_stats: AIStats | None = None,
     ) -> None:
@@ -56,9 +57,13 @@ class TuyaMQTTBridge:
         self._recipients_cfg = recipients_cfg  # {area: {human: "...", tech: "..."}}
         self._uid            = uid
         self._access_id      = access_id
+        self._core_coord     = core_coord      # coordinator for this project's device list only
         self._ai_client      = ai_client   # None = AI disabled
         self._ai_stats       = ai_stats
         self._task: asyncio.Task | None = None
+        self._local_keys: dict[str, str] = {}    # device_id → local_key
+        self._product_ids: dict[str, str] = {}  # device_id → product_id (for v4 blob decrypt)
+        self._uuids: dict[str, str] = {}         # device_id → uuid
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -75,6 +80,7 @@ class TuyaMQTTBridge:
 
     async def _run(self) -> None:
         _LOGGER.info("Tuya MQTT bridge starting")
+        await self._hass.async_add_executor_job(self._fetch_local_keys)
         reconnect_delay = 5  # seconds between reconnects after a drop
         while True:
             try:
@@ -84,9 +90,11 @@ class TuyaMQTTBridge:
                     await asyncio.sleep(RETRY_DELAY_S)
                     continue
 
-                expire_s   = creds.get("expire_time", 7200)
-                refresh_at = time.monotonic() + expire_s - RECONNECT_BUFFER_S
-                key        = creds["password"][8:24].encode()   # AES-128-ECB session key
+                expire_s    = creds.get("expire_time", 7200)
+                refresh_at  = time.monotonic() + expire_s - RECONNECT_BUFFER_S
+                full_pw     = creds["password"]
+                key         = full_pw[8:24].encode()   # AES-128-ECB envelope key
+                _LOGGER.debug("MQTT password len=%d prefix=%s", len(full_pw), full_pw[:8])
 
                 loop = asyncio.get_event_loop()
                 disconnect_event = asyncio.Event()
@@ -96,9 +104,9 @@ class TuyaMQTTBridge:
                     await asyncio.sleep(RETRY_DELAY_S)
                     continue
 
-                def on_message(c, userdata, msg):
+                def on_message(c, userdata, msg, _pw=full_pw):
                     asyncio.run_coroutine_threadsafe(
-                        self._handle(msg.payload, key), loop
+                        self._handle(msg.payload, key, _pw), loop
                     )
 
                 def on_disconnect(c, userdata, *args):
@@ -133,6 +141,55 @@ class TuyaMQTTBridge:
 
     # ── Connection helpers (blocking — called via executor) ───────────────────
 
+    def _fetch_local_keys(self) -> None:
+        """Fetch and cache local_key for every camera — used to decrypt v4 file blobs.
+
+        Calls /v1.0/devices/{id} per camera (proven to return local_key).
+        Only runs once at bridge start — 1 API call per camera, acceptable.
+        """
+        try:
+            devices: list[dict] = []
+            if self._core_coord and self._core_coord.data:
+                devices = self._core_coord.data.get("devices", [])
+            else:
+                # fallback: first available core entry (single-project installs)
+                for entry_data in self._hass.data.get("tuya_home_core", {}).values():
+                    coord = entry_data.get("coordinator")
+                    if coord and coord.data:
+                        devices = coord.data.get("devices", [])
+                        break
+
+            for dev in devices:
+                dev_id = dev.get("id") or dev.get("devId", "")
+                if not dev_id:
+                    continue
+                # coordinator data rarely includes local_key — try direct fetch
+                lk  = dev.get("local_key", "")
+                pid = dev.get("product_id", "")
+                uid = dev.get("uuid", "")
+                if not lk:
+                    try:
+                        r   = self._tuya_client.cloudrequest(f"/v1.0/devices/{dev_id}")
+                        res = (r or {}).get("result", {})
+                        lk  = res.get("local_key", "")
+                        pid = pid or res.get("product_id", "")
+                        uid = uid or res.get("uuid", "")
+                    except Exception:
+                        pass
+                if lk:
+                    self._local_keys[dev_id] = lk
+                if pid:
+                    self._product_ids[dev_id] = pid
+                if uid:
+                    self._uuids[dev_id] = uid
+
+            _LOGGER.debug(
+                "Local keys cached for %d/%d devices (%d product_ids, %d uuids)",
+                len(self._local_keys), len(devices), len(self._product_ids), len(self._uuids)
+            )
+        except Exception as err:
+            _LOGGER.debug("Local key fetch failed: %s", err)
+
     def _fetch_creds(self) -> dict | None:
         try:
             r = self._tuya_client.cloudrequest(
@@ -146,7 +203,9 @@ class TuyaMQTTBridge:
                 },
             )
             if r and r.get("success"):
-                return r["result"]
+                result = r["result"]
+                _LOGGER.debug("MQTT creds fields: %s", list(result.keys()))
+                return result
             _LOGGER.error("MQTT creds API error: %s", r)
         except Exception as err:
             _LOGGER.error("MQTT creds fetch exception: %s", err)
@@ -208,7 +267,7 @@ class TuyaMQTTBridge:
 
     # ── Message handling (async, on HA event loop) ────────────────────────────
 
-    async def _handle(self, payload: bytes, key: bytes) -> None:
+    async def _handle(self, payload: bytes, key: bytes, full_password: str = "") -> None:
         try:
             envelope = json.loads(payload)
         except Exception:
@@ -249,24 +308,67 @@ class TuyaMQTTBridge:
         newest    = max(motion_dps, key=lambda s: s.get("t", 0))
         t_ms      = newest.get("t", int(time.time())) * 1000
         raw_v     = newest.get("value", "")
-        ev        = self._parse_motion_value(newest["code"], raw_v)
+        ev        = self._parse_motion_value(
+            newest["code"], raw_v, key,
+            access_id=getattr(self._tuya_client, "apiKey", ""),
+            access_secret=getattr(self._tuya_client, "apiSecret", ""),
+            device_key=self._local_keys.get(dev_id, ""),
+            event_t=newest.get("t", 0),
+            full_password=full_password,
+            product_id=self._product_ids.get(dev_id, ""),
+            device_uuid=self._uuids.get(dev_id, ""),
+        )
         age_s     = (time.time() * 1000 - t_ms) / 1000
+
+        _LOGGER.debug(
+            "Motion %s/%s: code=%s bucket=%r files=%r",
+            area, name, newest["code"], ev.get("bucket"), ev.get("files"),
+        )
 
         img_bytes = None
         snap_note = ""
 
         if ev.get("bucket") and ev.get("files"):
-            parts     = ev["files"][0] if ev.get("files") else []
-            file_path = parts[0] if len(parts) > 0 else ""
-            file_key  = parts[1] if len(parts) > 1 else ""
-            img_bytes = await self._hass.async_add_executor_job(
-                self._camera_api.try_oss_image, ev["bucket"], file_path, file_key
-            )
-            if img_bytes:
-                _LOGGER.debug("Motion %s/%s: OSS image ok (age %.0fs)", area, name, age_s)
+            if ev["bucket"] == "__inline_jpeg__":
+                # v4.0 inline thumbnail embedded in MQTT message
+                raw_inline = ev["files"][0]
+                if isinstance(raw_inline, (bytes, str)):
+                    img_bytes = raw_inline if isinstance(raw_inline, bytes) else raw_inline.encode("latin-1")
+                    _LOGGER.debug("Motion %s/%s: inline JPEG from v4 blob (%d bytes)", area, name, len(img_bytes))
+            else:
+                parts     = ev["files"][0] if ev.get("files") else []
+                file_path = parts[0] if len(parts) > 0 else ""
+                file_key  = parts[1] if len(parts) > 1 else ""
+                # Signed CDN URLs (?param=...) are IP-restricted and return 403 from
+                # any third-party server. Skip OSS when no decrypt key either — nothing
+                # we can do; fall through to HA snapshot.
+                if "?param=" in file_path and not file_key:
+                    _LOGGER.debug(
+                        "Motion %s/%s: signed CDN URL with no key — skipping OSS",
+                        area, name,
+                    )
+                else:
+                    _LOGGER.debug(
+                        "Motion %s/%s: OSS attempt — bucket=%r path=%r key_len=%d",
+                        area, name, ev["bucket"], file_path, len(file_key),
+                    )
+                    img_bytes = await self._hass.async_add_executor_job(
+                        self._camera_api.try_oss_image, ev["bucket"], file_path, file_key
+                    )
+                    if img_bytes:
+                        _LOGGER.debug("Motion %s/%s: OSS image ok (age %.0fs)", area, name, age_s)
+                    else:
+                        _LOGGER.debug("Motion %s/%s: OSS download returned None", area, name)
 
         if not img_bytes:
-            _LOGGER.debug("Motion %s/%s: no OSS image", area, name)
+            _LOGGER.debug("Motion %s/%s: no OSS image — trying HA snapshot", area, name)
+            snap_bytes = await self._get_ha_snapshot(dev_id)
+            if snap_bytes:
+                img_bytes = snap_bytes
+                snap_note = f"live snapshot ({age_s:.0f}s after event — person may have left)"
+                _LOGGER.debug("Motion %s/%s: HA snapshot ok (age %.0fs)", area, name, age_s)
+            else:
+                _LOGGER.debug("Motion %s/%s: no image available", area, name)
 
         ev_ts = datetime.fromtimestamp(t_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -327,6 +429,32 @@ class TuyaMQTTBridge:
             )
             _LOGGER.info("Motion alert sent for %s/%s to %s", area, name, to_addrs)
 
+    async def _get_ha_snapshot(self, dev_id: str) -> bytes | None:
+        """Fetch a live snapshot from the HA camera entity for this Tuya device."""
+        try:
+            from homeassistant.helpers import entity_registry as er
+            from homeassistant.components.camera import async_get_image
+
+            registry  = er.async_get(self._hass)
+            entity_id = None
+            for entry in registry.entities.values():
+                uid = entry.unique_id or ""
+                if entry.entity_id.startswith("camera.") and (
+                    uid == f"tuya.{dev_id}" or uid == dev_id
+                ):
+                    entity_id = entry.entity_id
+                    break
+
+            if not entity_id:
+                _LOGGER.debug("No HA camera entity found for device %s", dev_id)
+                return None
+
+            image = await async_get_image(self._hass, entity_id, timeout=5)
+            return image.content
+        except Exception as err:
+            _LOGGER.debug("HA snapshot error for %s: %s", dev_id, err)
+            return None
+
     def _get_recipients(self, area: str, kind: str) -> list[str]:
         import re
         raw = self._recipients_cfg.get(area, {}).get(kind, "")
@@ -355,11 +483,260 @@ class TuyaMQTTBridge:
                     return {}
         return {}
 
-    @staticmethod
-    def _parse_motion_value(code: str, raw: Any) -> dict:
+    @classmethod
+    def _parse_motion_value(
+        cls, code: str, raw: Any,
+        mqtt_key: bytes | None = None,
+        access_id: str = "",
+        access_secret: str = "",
+        device_key: str = "",
+        event_t: int = 0,
+        full_password: str = "",
+        product_id: str = "",
+        device_uuid: str = "",
+    ) -> dict:
         try:
             if code == "movement_detect_pic":
-                return json.loads(raw) if isinstance(raw, str) else raw
-            return json.loads(base64.b64decode(raw).decode())
-        except Exception:
+                # Try plain JSON first, then base64-encoded JSON (newer firmware sends b64)
+                parsed: dict = {}
+                if isinstance(raw, dict):
+                    parsed = raw
+                elif isinstance(raw, str):
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception:
+                        pass
+                    if not parsed.get("bucket"):
+                        try:
+                            parsed = json.loads(base64.b64decode(raw).decode())
+                        except Exception:
+                            pass
+                _LOGGER.debug("movement_detect_pic bucket=%r files=%r", parsed.get("bucket"), parsed.get("files"))
+                return parsed
+            ev = json.loads(base64.b64decode(raw).decode())
+
+            # v4.0 new format: files is list of {data, keyId, iv} objects — no bucket field.
+            files = ev.get("files", [])
+            if files and isinstance(files[0], dict):
+                ev["bucket"], ev["files"] = cls._decrypt_v4_files(
+                    files, mqtt_key, access_id, access_secret, device_key,
+                    event_t, full_password, product_id, device_uuid
+                )
+            return ev
+        except Exception as exc:
+            _LOGGER.debug("_parse_motion_value failed code=%s exc=%s", code, exc)
             return {}
+
+    @staticmethod
+    def _decrypt_v4_files(
+        file_objects: list,
+        mqtt_key: bytes | None,
+        access_id: str = "",
+        access_secret: str = "",
+        device_key: str = "",
+        event_t: int = 0,
+        full_password: str = "",
+        product_id: str = "",
+        device_uuid: str = "",
+    ) -> tuple[str | None, list]:
+        """Decrypt v4.0 file blobs → (bucket, [[path, filekey], ...]).
+
+        keyId='default' references a stable platform key. Tries CBC, CTR, and GCM modes
+        across all plausible key derivations. GCM uses timestamp as AAD (official SDK pattern).
+        """
+        import hashlib, hmac as _hmac
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        best_ratio = [0.0]
+
+        def _check(dec: bytes, mode_label: str, label: str) -> str | None:
+            """Return plaintext if looks like a path, or JPEG sentinel if JPEG magic."""
+            if dec[:2] == b"\xff\xd8":
+                _LOGGER.debug("v4 decrypt: JPEG magic with %s/%s", label, mode_label)
+                return "\xff\xd8JPEG"
+            printable = sum(1 for b in dec if 32 <= b < 127)
+            ratio = printable / max(len(dec), 1)
+            if ratio > best_ratio[0]:
+                best_ratio[0] = ratio
+            return dec.decode("utf-8", errors="replace") if ratio > 0.80 else None
+
+        def _try(label: str, k: bytes, data: bytes, iv: bytes) -> str | None:
+            if len(k) not in (16, 24, 32):
+                return None
+
+            # ECB mode (no IV — same as MQTT envelope decryption)
+            if len(k) == 16:
+                try:
+                    ctx = Cipher(algorithms.AES(k), modes.ECB(), backend=default_backend()).decryptor()
+                    dec = ctx.update(data) + ctx.finalize()
+                    pad = dec[-1]
+                    if 1 <= pad <= 16:
+                        dec = dec[:-pad]
+                    result = _check(dec, "ECB", label)
+                    if result:
+                        return result
+                except Exception:
+                    pass
+
+            # CBC mode
+            try:
+                ctx = Cipher(algorithms.AES(k), modes.CBC(iv), backend=default_backend()).decryptor()
+                dec = ctx.update(data) + ctx.finalize()
+                pad = dec[-1]
+                if 1 <= pad <= 16:
+                    dec = dec[:-pad]
+                result = _check(dec, "CBC", label)
+                if result:
+                    return result
+            except Exception:
+                pass
+
+            # CTR mode (no padding, keystream XOR)
+            try:
+                ctx = Cipher(algorithms.AES(k), modes.CTR(iv), backend=default_backend()).decryptor()
+                dec = ctx.update(data) + ctx.finalize()
+                result = _check(dec, "CTR", label)
+                if result:
+                    return result
+            except Exception:
+                pass
+
+            # GCM mode: nonce = iv[:12], tag = data[-16:], ciphertext = data[:-16]
+            # AAD variants: empty, str(event_t), str(event_t).encode()
+            if len(data) > 16 and len(k) == 16:
+                nonce = iv[:12]
+                ct    = data[:-16]
+                tag   = data[-16:]
+                for aad_label, aad in [("no_aad", b""), ("aad_t", str(event_t).encode())]:
+                    try:
+                        aesgcm = AESGCM(k)
+                        dec = aesgcm.decrypt(nonce, ct + tag, aad if aad else None)
+                        result = _check(dec, f"GCM/{aad_label}", label)
+                        if result:
+                            return result
+                    except Exception:
+                        pass
+
+            return None
+
+        def _candidates(data: bytes, iv: bytes) -> str | None:
+            combos: list[tuple[str, bytes]] = []
+            s  = access_secret
+            ai = access_id
+            pw = full_password
+
+            if product_id and len(product_id) == 16:
+                combos.append(("product_id",                      product_id.encode()))
+                combos.append(("md5(product_id)[:16]",
+                               hashlib.md5(product_id.encode()).digest()))
+
+            if device_uuid and len(device_uuid) >= 16:
+                combos.append(("uuid[:16]",                       device_uuid[:16].encode()))
+                combos.append(("md5(uuid)[:16]",
+                               hashlib.md5(device_uuid.encode()).digest()))
+
+            if device_key:
+                dk = device_key.encode()[:16]
+                combos.append(("device_local_key",                dk))
+                combos.append(("md5(device_key)[:16]",
+                               hashlib.md5(device_key.encode()).digest()))
+
+            if pw and len(pw) >= 24:
+                combos += [
+                    ("password[:16]",                              pw[:16].encode()),
+                    ("password[8:24]",                             pw[8:24].encode()),  # same as mqtt_key
+                    ("password[-16:]",                             pw[-16:].encode()),
+                    ("password[16:32]",                            pw[16:32].encode()),
+                ]
+                if len(pw) >= 32:
+                    combos.append(("password[0:8]+[24:32]",        (pw[0:8]+pw[24:32]).encode()))
+            elif mqtt_key:
+                combos.append(("mqtt_password[8:24]",             mqtt_key))
+
+            if ai:
+                combos.append(("access_id[:16]",                  ai[:16].encode()))
+
+            if s:
+                combos += [
+                    ("access_secret[:16]",                         s[:16].encode()),
+                    ("access_secret[8:24]",                        s[8:24].encode()),
+                    ("access_secret[-16:]",                        s[-16:].encode()),
+                ]
+                if len(s) >= 32:
+                    try:
+                        combos += [
+                            ("fromhex(secret[:32])",               bytes.fromhex(s[:32])),
+                            ("fromhex(secret[8:40])",              bytes.fromhex(s[8:40])),
+                        ]
+                    except ValueError:
+                        pass
+                md5s = hashlib.md5(s.encode()).digest()
+                md5h = hashlib.md5(s.encode()).hexdigest()
+                combos += [
+                    ("md5(secret)_raw[:16]",                       md5s),
+                    ("md5(secret)_hex[8:24]",                      md5h[8:24].encode()),
+                    ("md5(secret)_hex[:16]",                       md5h[:16].encode()),
+                    ("sha256(secret)[:16]",                        hashlib.sha256(s.encode()).digest()[:16]),
+                ]
+
+            if ai and s:
+                for combo_key, combo_label in [
+                    (ai + s, "id+secret"),
+                    (s + ai, "secret+id"),
+                    (ai,     "id_only"),
+                ]:
+                    md5d = hashlib.md5(combo_key.encode()).digest()
+                    md5h = hashlib.md5(combo_key.encode()).hexdigest()
+                    combos += [
+                        (f"md5({combo_label})_raw[:16]",           md5d),
+                        (f"md5({combo_label})_hex[:16]",           md5h[:16].encode()),
+                        (f"md5({combo_label})_hex[8:24]",          md5h[8:24].encode()),
+                        (f"sha256({combo_label})[:16]",            hashlib.sha256(combo_key.encode()).digest()[:16]),
+                        (f"hmac_sha256(secret,{combo_label})[:16]",
+                         _hmac.new(s.encode(), combo_key.encode(), hashlib.sha256).digest()[:16]),
+                    ]
+
+            for label, k in combos:
+                result = _try(label, k, data, iv)
+                if result:
+                    return result
+            return None
+
+        bucket = None
+        files  = []
+        for obj in file_objects:
+            try:
+                raw_bytes = bytes.fromhex(obj["data"])
+                iv_bytes  = bytes.fromhex(obj["iv"])
+                _LOGGER.debug(
+                    "v4 file blob: keyId=%r data_len=%d iv=%s data=%s",
+                    obj.get("keyId"), len(raw_bytes), obj["iv"], obj["data"]
+                )
+                best_ratio[0] = 0.0
+                plaintext = _candidates(raw_bytes, iv_bytes)
+                if not plaintext:
+                    _LOGGER.debug(
+                        "v4 blob: keyId=%r len=%d — no candidate worked (best ratio=%.2f)",
+                        obj.get("keyId"), len(raw_bytes), best_ratio[0]
+                    )
+                    continue
+                if plaintext.startswith("\xff\xd8"):
+                    # Inline thumbnail — log and skip OSS path (handled by caller via sentinel)
+                    _LOGGER.debug("v4 file blob: inline JPEG detected (%d bytes)", len(plaintext))
+                    bucket = "__inline_jpeg__"
+                    files.append(plaintext)   # raw bytes as list element
+                    continue
+                _LOGGER.debug("v4 file blob plaintext: %r", plaintext)
+                # Format: "bucket/path/to/file.jpg|filekey"  or  just path
+                parts = plaintext.split("|", 1)
+                full  = parts[0].strip()
+                fkey  = parts[1].strip() if len(parts) > 1 else ""
+                segs  = full.split("/", 1)
+                bucket = segs[0]
+                path   = "/" + segs[1] if len(segs) > 1 else full
+                files.append([path, fkey])
+            except Exception as exc:
+                _LOGGER.debug("v4 file blob decrypt failed: %s", exc)
+        return bucket, files

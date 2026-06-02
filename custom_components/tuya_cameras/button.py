@@ -10,6 +10,7 @@ import logging
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -47,13 +48,14 @@ async def async_setup_entry(
 
 class RefreshButton(ButtonEntity):
     """
-    Central refresh: sequentially refreshes the core device list then camera SD status.
-    One button for all cameras — use this to pick up new/changed devices or fresh SD data.
+    Per-entry refresh: refreshes the core device list then camera SD status for this entry.
+    Hidden from the main UI (DIAGNOSTIC) — use tuya_cameras.refresh_all service instead.
     """
 
-    _attr_has_entity_name = True
-    _attr_name            = "Refresh"
-    _attr_icon            = "mdi:refresh"
+    _attr_has_entity_name  = True
+    _attr_name             = "Refresh"
+    _attr_icon             = "mdi:refresh"
+    _attr_entity_category  = EntityCategory.DIAGNOSTIC
 
     def __init__(
         self,
@@ -81,9 +83,10 @@ class RefreshButton(ButtonEntity):
 class TestMailerButton(ButtonEntity):
     """Sends a test email to the tech recipient of every configured area."""
 
-    _attr_has_entity_name = True
-    _attr_name            = "Test Mailer"
-    _attr_icon            = "mdi:email-check"
+    _attr_has_entity_name  = True
+    _attr_name             = "Test Mailer"
+    _attr_icon             = "mdi:email-check"
+    _attr_entity_category  = EntityCategory.DIAGNOSTIC
 
     def __init__(self, entry: ConfigEntry, notifier: Notifier) -> None:
         self._entry    = entry

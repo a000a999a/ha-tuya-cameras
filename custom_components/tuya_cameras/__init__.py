@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import logging
+import os
+
+import yaml
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import entity_registry as er
 
 from .ai_client import AIClient
 from .ai_stats import AIStats
@@ -23,6 +27,125 @@ from .notify import Notifier
 
 _LOGGER = logging.getLogger(__name__)
 PLATFORMS = ["sensor", "button"]
+
+
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Register domain-wide services (called once regardless of how many entries exist)."""
+
+    async def _handle_refresh_all(call: ServiceCall) -> None:
+        """Refresh every tuya_cameras entry, then regenerate the Lovelace dashboard."""
+        entries = hass.data.get(DOMAIN, {})
+        if not entries:
+            _LOGGER.warning("refresh_all: no tuya_cameras entries loaded")
+            return
+        for entry_id, data in entries.items():
+            core_coord = data.get("core_coord")
+            cam_coord  = data.get("coordinator")
+            try:
+                if core_coord:
+                    await core_coord.async_refresh()
+                if cam_coord:
+                    await cam_coord.async_refresh()
+                _LOGGER.debug("refresh_all: refreshed entry %s", entry_id)
+            except Exception as err:
+                _LOGGER.error("refresh_all: error refreshing entry %s: %s", entry_id, err)
+        _LOGGER.info("refresh_all: done (%d entries refreshed)", len(entries))
+        await _generate_lovelace_dashboard(hass)
+
+    hass.services.async_register(DOMAIN, "refresh_all", _handle_refresh_all)
+    return True
+
+
+async def _generate_lovelace_dashboard(hass: HomeAssistant) -> None:
+    """
+    Write tuya_cameras_lovelace.yaml to the HA config directory.
+
+    Groups all cameras by area across every tuya_cameras entry.
+    Each area becomes a separate dashboard view (tab).
+    Entity IDs are resolved via the entity registry — cameras not yet registered
+    (newly discovered, requiring an integration reload) are skipped with a log warning.
+    """
+    registry   = er.async_get(hass)
+    domain_data = hass.data.get(DOMAIN, {})
+
+    areas: dict[str, list[dict]] = {}
+    missing: list[str] = []
+
+    for entry_id, data in domain_data.items():
+        cam_data = (data.get("coordinator").data or {}).get("cameras", {})
+        for dev_id, cam in cam_data.items():
+            area = cam.get("area") or "Unknown"
+
+            sd_eid     = registry.async_get_entity_id("sensor", DOMAIN, f"{entry_id}_{dev_id}_sd_pct")
+            online_eid = registry.async_get_entity_id("sensor", DOMAIN, f"{entry_id}_{dev_id}_online")
+            fmt_eid    = registry.async_get_entity_id("button", DOMAIN, f"{entry_id}_{dev_id}_format_sd")
+
+            if not online_eid and not sd_eid:
+                missing.append(cam.get("name", dev_id))
+                continue
+
+            areas.setdefault(area, []).append({
+                "name":       cam["name"],
+                "online":     cam.get("online", False),
+                "online_eid": online_eid,
+                "sd_eid":     sd_eid,
+                "fmt_eid":    fmt_eid,
+            })
+
+    if missing:
+        _LOGGER.warning(
+            "Lovelace gen: %d camera(s) have no registered entities yet (integration reload needed): %s",
+            len(missing), ", ".join(missing),
+        )
+
+    if not areas:
+        _LOGGER.warning("Lovelace gen: no camera entities found — skipping YAML write")
+        return
+
+    views = []
+    for area in sorted(areas):
+        cams  = sorted(areas[area], key=lambda c: c["name"])
+        cards = []
+
+        for cam in cams:
+            entities = []
+            if cam["online_eid"]:
+                entities.append({"entity": cam["online_eid"], "name": "Status"})
+            if cam["sd_eid"]:
+                entities.append({"entity": cam["sd_eid"],     "name": "SD Card"})
+            if cam["fmt_eid"]:
+                entities.append({"entity": cam["fmt_eid"],    "name": "Format SD Card"})
+
+            if entities:
+                cards.append({
+                    "type":     "entities",
+                    "title":    cam["name"],
+                    "icon":     "mdi:cctv" if cam["online"] else "mdi:cctv-off",
+                    "entities": entities,
+                })
+
+        if cards:
+            views.append({
+                "title":  f"{area}  ({len(cams)})",
+                "path":   area.lower().replace(" ", "_"),
+                "icon":   "mdi:cctv",
+                "badges": [],
+                "cards":  cards,
+            })
+
+    dashboard = {"title": "Tuya Cameras", "views": views}
+    path = os.path.join(hass.config.config_dir, "tuya_cameras_lovelace.yaml")
+
+    def _write() -> None:
+        with open(path, "w", encoding="utf-8") as fh:
+            yaml.dump(dashboard, fh, allow_unicode=True, sort_keys=False, default_flow_style=False)
+
+    await hass.async_add_executor_job(_write)
+    total = sum(len(c) for c in areas.values())
+    _LOGGER.info(
+        "Lovelace dashboard written: %s  (%d areas · %d cameras)",
+        path, len(areas), total,
+    )
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -78,6 +201,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         recipients_cfg = recipients,
         uid            = uid,
         access_id      = access_id,
+        core_coord     = core_coord,
         ai_client      = ai_client,
         ai_stats       = ai_stats,
     )
