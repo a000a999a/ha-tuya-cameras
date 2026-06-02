@@ -34,7 +34,7 @@ class Notifier:
             msg = MIMEMultipart("related")
             msg["Subject"] = subject
             msg["From"]    = self._sender
-            msg["To"]      = "; ".join(to_addrs)
+            msg["To"]      = ", ".join(to_addrs)
 
             alt = MIMEMultipart("alternative")
             alt.attach(MIMEText(body_html, "html"))
