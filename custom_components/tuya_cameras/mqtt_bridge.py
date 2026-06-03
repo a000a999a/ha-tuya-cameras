@@ -365,7 +365,10 @@ class TuyaMQTTBridge:
                 snap_note = f"live snapshot ({age_s:.0f}s after event — person may have left)"
                 _LOGGER.debug("Motion %s/%s: HA snapshot ok (age %.0fs)", area, name, age_s)
             else:
-                _LOGGER.debug("Motion %s/%s: no image available", area, name)
+                _LOGGER.warning(
+                    "Motion %s/%s: no image available (OSS failed + HA snapshot failed) — event discarded",
+                    area, name,
+                )
 
         ev_ts = datetime.fromtimestamp(t_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -374,7 +377,7 @@ class TuyaMQTTBridge:
 
         if self._ai_client is not None:
             if not img_bytes:
-                _LOGGER.debug("Motion %s/%s: AI enabled, no image — discarding", area, name)
+                _LOGGER.warning("Motion %s/%s: AI enabled but no image — event discarded", area, name)
                 return
 
             ai_result = await self._ai_client.analyze(img_bytes)
@@ -446,10 +449,10 @@ class TuyaMQTTBridge:
                 _LOGGER.debug("No HA camera entity found for device %s", dev_id)
                 return None
 
-            image = await async_get_image(self._hass, entity_id, timeout=5)
+            image = await async_get_image(self._hass, entity_id, timeout=10)
             return image.content
         except Exception as err:
-            _LOGGER.debug("HA snapshot error for %s: %s", dev_id, err)
+            _LOGGER.warning("HA snapshot failed for device %s (%s): %s", dev_id, entity_id or "?", err)
             return None
 
     def _get_recipients(self, area: str, kind: str) -> list[str]:
