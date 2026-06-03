@@ -77,25 +77,24 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             # Allow entity registration to settle after config entry reload
             await asyncio.sleep(5)
 
-        await _update_lovelace_cameras_view(hass)
+        await _update_lovelace_views(hass)
 
     hass.services.async_register(DOMAIN, "refresh_all", _handle_refresh_all)
     return True
 
 
-async def _update_lovelace_cameras_view(hass: HomeAssistant) -> None:
+async def _update_lovelace_views(hass: HomeAssistant) -> None:
     """
-    Update picture-glance card entities in the Lovelace Cameras view.
+    Update both the Cameras view and the AI Detections view in the Overview dashboard.
 
-    Matches cards by title (case-insensitive) against camera names from the
-    coordinator. Only fills in entities for cards that currently have none —
-    existing cards with entities are left untouched so manual customisations
-    are preserved.
+    Cameras view: fills picture-glance card entities for cards with empty entities.
+    AI Detections view: rebuilds Last Human Detection tiles for all known areas;
+      adds missing Live Counts / 7-Day Summary stats for new tuya_cameras entries.
     """
     registry    = er.async_get(hass)
     domain_data = hass.data.get(DOMAIN, {})
 
-    # Build: lowercase camera name → entity IDs
+    # Build: lowercase camera name → entity IDs (for Cameras view)
     name_map: dict[str, dict] = {}
     for entry_id, data in domain_data.items():
         cam_data = (data.get("coordinator").data or {}).get("cameras", {})
@@ -111,10 +110,6 @@ async def _update_lovelace_cameras_view(hass: HomeAssistant) -> None:
                     "sd": sd_eid, "online": online_eid, "fmt": fmt_eid,
                 }
 
-    if not name_map:
-        _LOGGER.warning("Lovelace update: no camera entities in registry yet")
-        return
-
     try:
         lovelace   = hass.data.get("lovelace", {})
         dashboard  = lovelace.get("dashboards", {}).get("lovelace")
@@ -126,15 +121,19 @@ async def _update_lovelace_cameras_view(hass: HomeAssistant) -> None:
         changed = False
 
         for view in config.get("views", []):
-            if view.get("path") == "cameras":
-                changed = _patch_empty_card_entities(view, name_map)
-                break
+            path = view.get("path", "")
+            if path == "cameras" and name_map:
+                if _patch_empty_card_entities(view, name_map):
+                    changed = True
+            elif path == "ai-detections":
+                if _patch_ai_detections_view(view, registry):
+                    changed = True
 
         if changed:
             await dashboard.async_save(config)
-            _LOGGER.info("Lovelace Cameras view updated (%d cameras in registry)", len(name_map))
+            _LOGGER.info("Lovelace views updated (cameras: %d, ai-detections patched)", len(name_map))
         else:
-            _LOGGER.debug("Lovelace update: all cards already have entities — nothing changed")
+            _LOGGER.debug("Lovelace update: no changes needed")
 
     except Exception as err:
         _LOGGER.error("Lovelace update failed: %s", err)
@@ -171,6 +170,104 @@ def _patch_empty_card_entities(view: dict, name_map: dict) -> bool:
                 card["entities"] = new_entities
                 _LOGGER.debug("Lovelace: filled entities for card '%s'", card.get("title"))
                 changed = True
+    return changed
+
+
+def _patch_ai_detections_view(view: dict, registry) -> bool:
+    """
+    Rebuild the AI Detections view sections dynamically:
+
+    • Last Human Detection — one tile per sensor.tuya_cameras_last_human_* entity,
+      sorted alphabetically by area name, covering all tuya_cameras entries.
+    • Live Counts — adds tile cards for any tuya_cameras entries not yet represented
+      (e.g. Wallis entry stats appear after the Main Home stats).
+    • 7-Day Summary — same: adds statistic cards for missing entries.
+    """
+    changed = False
+    sections = view.get("sections", [])
+
+    # ── Last Human Detection ─────────────────────────────────────────────────
+    last_human: list[tuple[str, str]] = []
+    for entry in registry.entities.values():
+        eid = entry.entity_id
+        if not eid.startswith("sensor.tuya_cameras_last_human_"):
+            continue
+        raw_name = (entry.original_name or "").replace("Last Human — ", "").strip()
+        if not raw_name:
+            raw_name = eid[len("sensor.tuya_cameras_last_human_"):].replace("_", " ").title()
+        last_human.append((raw_name, eid))
+    last_human.sort(key=lambda x: x[0])
+
+    new_lh_cards = [{"type": "heading", "heading": "Last Human Detection"}]
+    for area_name, sensor_eid in last_human:
+        new_lh_cards.append({
+            "type": "tile", "entity": sensor_eid,
+            "name": area_name, "icon": "mdi:account-clock",
+        })
+
+    for section in sections:
+        cards = section.get("cards", [])
+        if any(c.get("heading") == "Last Human Detection" for c in cards):
+            if cards != new_lh_cards:
+                section["cards"] = new_lh_cards
+                changed = True
+            break
+
+    # ── Live Counts — add tiles for missing entries ───────────────────────────
+    all_processed = sorted(
+        e.entity_id for e in registry.entities.values()
+        if e.entity_id.startswith("sensor.tuya_cameras_ai_processed_7d")
+    )
+    for section in sections:
+        cards = section.get("cards", [])
+        if not any(c.get("heading") == "Live Counts" for c in cards):
+            continue
+        existing = {c.get("entity") for c in cards}
+        for p_eid in all_processed:
+            if p_eid in existing:
+                continue
+            suffix = p_eid[len("sensor.tuya_cameras_ai_processed_7d"):]
+            h_eid  = f"sensor.tuya_cameras_ai_human_detected_7d{suffix}"
+            d_eid  = f"sensor.tuya_cameras_ai_discarded_7d{suffix}"
+            label  = f" ({suffix.lstrip('_')})" if suffix else ""
+            cards += [
+                {"type": "tile", "entity": p_eid,
+                 "name": f"Processed (7d){label}", "icon": "mdi:image-multiple"},
+                {"type": "tile", "entity": h_eid,
+                 "name": f"Human Detected (7d){label}", "icon": "mdi:account-check", "color": "red"},
+                {"type": "tile", "entity": d_eid,
+                 "name": f"Discarded (7d){label}", "icon": "mdi:account-off"},
+            ]
+            changed = True
+        break
+
+    # ── 7-Day Summary — add statistic cards for missing entries ───────────────
+    for section in sections:
+        cards = section.get("cards", [])
+        if not any(c.get("heading") == "7-Day Summary" for c in cards):
+            continue
+        existing = {c.get("entity") for c in cards}
+        for p_eid in all_processed:
+            if p_eid in existing:
+                continue
+            suffix = p_eid[len("sensor.tuya_cameras_ai_processed_7d"):]
+            h_eid  = f"sensor.tuya_cameras_ai_human_detected_7d{suffix}"
+            d_eid  = f"sensor.tuya_cameras_ai_discarded_7d{suffix}"
+            label  = f" ({suffix.lstrip('_')})" if suffix else ""
+            period = {"calendar": {"period": "week"}}
+            cards += [
+                {"type": "statistic", "entity": p_eid,
+                 "name": f"Processed{label}", "stat_type": "state", "period": period},
+                {"type": "statistic", "entity": h_eid,
+                 "name": f"Human Detected{label}", "stat_type": "state", "period": period},
+                {"type": "statistic", "entity": d_eid,
+                 "name": f"Discarded{label}", "stat_type": "state", "period": period},
+            ]
+            changed = True
+        break
+
+    if changed:
+        _LOGGER.debug("Lovelace: AI Detections view patched (%d last-human areas)", len(last_human))
     return changed
 
 
