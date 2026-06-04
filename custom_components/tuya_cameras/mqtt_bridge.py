@@ -281,11 +281,7 @@ class TuyaMQTTBridge:
         if not dev_id or not isinstance(status, list):
             return
 
-        motion_dps = [s for s in status if s.get("code") in ("initiative_message", "movement_detect_pic")]
-        if not motion_dps:
-            return
-
-        # Use this bridge's own core coordinator — avoids wrong-project camera lookup
+        # Build camera list before the code filter so we can log unknown codes from known cameras
         cameras: dict = {}
         if self._core_coord and self._core_coord.data:
             cam_list = self._camera_api.cameras_from_devices(
@@ -293,6 +289,13 @@ class TuyaMQTTBridge:
                 self._core_coord.data.get("areas", {}),
             )
             cameras = {c["id"]: c for c in cam_list}
+
+        motion_dps = [s for s in status if s.get("code") in ("initiative_message", "movement_detect_pic")]
+        if not motion_dps:
+            if dev_id in cameras:
+                codes = [s.get("code") for s in status if s.get("code")]
+                _LOGGER.debug("Known camera %s sent DPS codes %r — no motion codes, skipping", dev_id, codes)
+            return
 
         cam = cameras.get(dev_id)
         if not cam:
@@ -322,8 +325,9 @@ class TuyaMQTTBridge:
             area, name, newest["code"], ev.get("bucket"), ev.get("files"),
         )
 
-        img_bytes = None
-        snap_note = ""
+        img_bytes     = None
+        snap_note     = ""
+        prefetched_ai: dict | None = None
 
         if ev.get("bucket") and ev.get("files"):
             if ev["bucket"] == "__inline_jpeg__":
@@ -336,14 +340,18 @@ class TuyaMQTTBridge:
                 parts     = ev["files"][0] if ev.get("files") else []
                 file_path = parts[0] if len(parts) > 0 else ""
                 file_key  = parts[1] if len(parts) > 1 else ""
-                # Signed CDN URLs (?param=...) are IP-restricted and return 403 from
-                # any third-party server. Skip OSS when no decrypt key either — nothing
-                # we can do; fall through to HA snapshot.
                 if "?param=" in file_path and not file_key:
-                    _LOGGER.debug(
-                        "Motion %s/%s: signed CDN URL with no key — skipping OSS",
-                        area, name,
+                    # Signed CDN URL — try fetching directly before giving up.
+                    # If the server returns a plain JPEG (HTTP 200), no decryption needed.
+                    # IP-restriction confirmed for Brazil CDN; EU/CH cameras untested.
+                    _LOGGER.debug("Motion %s/%s: signed CDN URL — attempting direct fetch", area, name)
+                    img_bytes = await self._hass.async_add_executor_job(
+                        self._camera_api.try_oss_image, ev["bucket"], file_path, ""
                     )
+                    if img_bytes:
+                        _LOGGER.debug("Motion %s/%s: signed CDN fetch ok (age %.0fs)", area, name, age_s)
+                    else:
+                        _LOGGER.debug("Motion %s/%s: signed CDN returned nothing — falling back to snapshot", area, name)
                 else:
                     _LOGGER.debug(
                         "Motion %s/%s: OSS attempt — bucket=%r path=%r key_len=%d",
@@ -358,17 +366,55 @@ class TuyaMQTTBridge:
                         _LOGGER.debug("Motion %s/%s: OSS download returned None", area, name)
 
         if not img_bytes:
-            _LOGGER.debug("Motion %s/%s: no OSS image — trying HA snapshot", area, name)
-            snap_bytes = await self._get_ha_snapshot(dev_id)
-            if snap_bytes:
-                img_bytes = snap_bytes
-                snap_note = f"live snapshot ({age_s:.0f}s after event — person may have left)"
-                _LOGGER.debug("Motion %s/%s: HA snapshot ok (age %.0fs)", area, name, age_s)
+            _LOGGER.debug("Motion %s/%s: no OSS image — trying HA snapshot(s)", area, name)
+            for attempt, delay in enumerate((0, 2, 4)):
+                if delay:
+                    await asyncio.sleep(delay)
+                snap = await self._get_ha_snapshot(dev_id)
+                if not snap:
+                    _LOGGER.debug("Motion %s/%s: snapshot %d/3 failed", area, name, attempt + 1)
+                    continue
+                snap_age  = age_s + delay
+                snap_note = f"live snapshot ({snap_age:.0f}s after event — person may have left)"
+                _LOGGER.debug("Motion %s/%s: snapshot at +%ds ok (age %.0fs)", area, name, delay, snap_age)
+
+                if self._ai_client is None:
+                    img_bytes = snap
+                    break
+
+                result = await self._ai_client.analyze(snap)
+                if result is None:
+                    # AI unavailable — fail-open with this snapshot
+                    img_bytes = snap
+                    break
+                if result["human"]:
+                    img_bytes = snap
+                    prefetched_ai = result
+                    _LOGGER.debug(
+                        "Motion %s/%s: human found at +%ds (conf=%.2f)",
+                        area, name, delay, result["confidence"],
+                    )
+                    break
+                if delay == 4:
+                    # Last attempt — discard cleanly without re-running AI below
+                    _LOGGER.debug(
+                        "Motion %s/%s: no human at +%ds (conf=%.2f) — all attempts exhausted",
+                        area, name, delay, result["confidence"],
+                    )
+                    if self._ai_stats:
+                        await self._ai_stats.async_record(human=False, area=area, camera=name)
+                        self._hass.bus.async_fire(EVENT_AI_UPDATED)
+                    return
+                _LOGGER.debug(
+                    "Motion %s/%s: no human at +%ds (conf=%.2f) — retrying",
+                    area, name, delay, result["confidence"],
+                )
             else:
                 _LOGGER.warning(
-                    "Motion %s/%s: no image available (OSS failed + HA snapshot failed) — event discarded",
+                    "Motion %s/%s: no image available (OSS failed + all snapshots failed) — event discarded",
                     area, name,
                 )
+                return
 
         ev_ts = datetime.fromtimestamp(t_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -380,7 +426,7 @@ class TuyaMQTTBridge:
                 _LOGGER.warning("Motion %s/%s: AI enabled but no image — event discarded", area, name)
                 return
 
-            ai_result = await self._ai_client.analyze(img_bytes)
+            ai_result = prefetched_ai if prefetched_ai is not None else await self._ai_client.analyze(img_bytes)
 
             if ai_result is None:
                 # Service unreachable or timed out — fail-open, email original image
