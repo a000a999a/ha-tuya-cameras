@@ -20,10 +20,13 @@ against a 26,000/month quota (23× daily budget). It was disabled 2026-05-22.
 1. Camera pushes DPS event (initiative_message or movement_detect_pic) via Tuya MQTT
 2. Bridge decrypts payload (AES-128-ECB, key=mqtt_password[8:24])
 3. Parses {devId, status[{code, value, t}]} — both DPS codes embed bucket+files
-4. Try OSS image download (images.tuyaeu.com/{bucket}/{path}) — encrypted with file_key
-5. If OSS fails → HA snapshot fallback (async_get_image via entity registry lookup)
-6. If no image at all → discard silently (no email, no YOLO call)
-7. Pass image to AI service → human detected: email annotated image / no human: discard
+4. Camera lookup performed BEFORE DPS code filter — unknown codes from known cameras logged at DEBUG
+5. Try OSS image download (images.tuyaeu.com/{bucket}/{path}) — encrypted with file_key
+   For ?param= signed URLs: attempt direct HTTP GET first (may return plain JPEG); if 403 → fall through
+6. If OSS fails → up to 3 HA snapshots at t=0/+2s/+4s with inline AI early-exit on first human hit
+7. If no image at all → log at WARNING and discard (no email, no YOLO call)
+8. Pass image to AI service → human detected: email annotated image / no human: discard
+   If prefetched_ai already set from snapshot loop → skip redundant re-analysis
 
 ## Image Decryption
 - OSS images are AES-128-ECB encrypted (most Brasil/Wallis cameras)
@@ -42,6 +45,9 @@ against a 26,000/month quota (23× daily budget). It was disabled 2026-05-22.
 - [ ] notify.py must never raise — catch all SMTP exceptions and log them
 - [ ] Per-area recipients come from options entry only — never hardcoded
 - [ ] OSS image download attempted before HA snapshot fallback
+- [ ] For ?param= signed URLs: try direct HTTP GET first, fall back to snapshot only on failure
+- [ ] Multi-snapshot loop (t=0/+2s/+4s) runs AI inline — do NOT add extra AI calls after the loop
+- [ ] Camera lookup must happen BEFORE the DPS code filter (preserves unknown-code logging for known cameras)
 - [ ] Image decryption uses cryptography library, not Crypto/pycryptodome
 
 ## DPS Event Codes
@@ -52,13 +58,16 @@ against a 26,000/month quota (23× daily budget). It was disabled 2026-05-22.
   30+ candidates tried (local_key, mqtt_key, access_secret, product_id, uuid, all combos) — none work.
 - movement_detect_pic: base64-encoded JSON (newer fw) or raw JSON (older) — Winti cameras AND Brasil cameras
   ALWAYS decode with base64.b64decode() first; if that fails, try json.loads() directly.
-  Winti format: {"bucket":"ty-eu-storage30-pic","files":[["/path.jpeg","filekey"]]}
+  Winti clean format (some cameras): {"bucket":"ty-eu-storage30-pic","files":[["/path.jpeg","filekey"]]}
     → OSS download + AES-ECB/CBC decryption works (clean path, non-empty key)
-  Brasil format: {"bucket":"ty-eu-storage30-pic","files":[["/path.jpeg?param=BASE64SIG",""]]}
-    → ?param= is a CDN auth token (32-byte HMAC, IP-restricted). Returns HTTP 403 from any 3rd-party IP.
-    → file_key is always empty → cannot decrypt even if download succeeded.
-    → SKIP OSS when path contains ?param= and key is empty. Use HA snapshot fallback.
+  ?param= format (Brasil cameras AND Winti Camera Door — confirmed 2026-06-04):
+    {"bucket":"ty-eu-storage30-pic","files":[["/path.jpeg?param=BASE64SIG",""]]}
+    → ?param= is a CDN auth token. file_key is always empty.
+    → v0.5.7: attempt direct HTTP GET first — plain JPEG returned by some CDN regions (EU/CH untested).
+    → If fetch fails (403 or non-JPEG) → fall through to multi-snapshot.
+    → IP-restriction confirmed for Brazil CDN. Camera Door result TBD (watch logs for "signed CDN fetch ok").
   OSS CDN URL format: images.tuyaeu.com/{bucket}{file_path} (bucket IS required in the path)
+  WARNING: Do NOT assume all Winti cameras use clean format — Camera Door uses ?param= despite being CH.
 
 ## OSS Image Decryption
 - OSS images use AES-ECB (older cameras) OR 4-byte header + 16-byte IV + 44-byte pad + AES-CBC (newer)
