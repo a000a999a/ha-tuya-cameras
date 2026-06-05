@@ -121,15 +121,38 @@ async def _update_lovelace_views(hass: HomeAssistant) -> None:
                 }
 
     try:
-        lovelace   = hass.data.get("lovelace", {})
-        dashboard  = lovelace.get("dashboards", {}).get("lovelace")
+        lovelace_obj = hass.data.get("lovelace")
+        if not lovelace_obj:
+            _LOGGER.warning("Lovelace update: no lovelace data in hass.data")
+            return
+
+        _LOGGER.debug("Lovelace type=%s attrs=%s", type(lovelace_obj).__name__,
+                      [a for a in dir(lovelace_obj) if not a.startswith("_")])
+
+        # Newer HA: LovelaceManager with .dashboards dict
+        # Older HA: direct dashboard object or dict
+        if hasattr(lovelace_obj, "dashboards"):
+            dashboard = lovelace_obj.dashboards.get("lovelace") or lovelace_obj.dashboards.get("")
+        elif isinstance(lovelace_obj, dict):
+            dashboard = lovelace_obj.get("dashboards", {}).get("lovelace")
+        else:
+            dashboard = None
+
         if not dashboard or not hasattr(dashboard, "async_load"):
-            _LOGGER.warning("Lovelace update: Overview dashboard not accessible via API")
+            _LOGGER.warning("Lovelace update: Overview dashboard not accessible (type=%s)", type(lovelace_obj).__name__)
             return
 
         config_obj = await dashboard.async_load(force=True)
-        # HA may return a LovelaceData object (newer) or a plain dict (older)
-        config  = config_obj.config if hasattr(config_obj, "config") else config_obj
+        _LOGGER.debug("Lovelace config_obj type=%s", type(config_obj).__name__)
+        if isinstance(config_obj, dict):
+            config = config_obj
+        elif hasattr(config_obj, "config") and isinstance(getattr(config_obj, "config", None), dict):
+            config = config_obj.config
+        elif hasattr(config_obj, "data") and isinstance(getattr(config_obj, "data", None), dict):
+            config = config_obj.data
+        else:
+            _LOGGER.warning("Lovelace: cannot extract raw config from %s — skipping", type(config_obj).__name__)
+            return
         changed = False
 
         for view in config.get("views", []):
@@ -142,7 +165,7 @@ async def _update_lovelace_views(hass: HomeAssistant) -> None:
                     changed = True
 
         if changed:
-            await dashboard.async_save(config_obj if hasattr(config_obj, "config") else config)
+            await dashboard.async_save(config)
             _LOGGER.info("Lovelace views updated (cameras: %d, ai-detections patched)", len(name_map))
         else:
             _LOGGER.debug("Lovelace update: no changes needed")
@@ -361,7 +384,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if entity.config_entry_id != entry.entry_id or entity.platform != DOMAIN:
                 continue
             parts = entity.unique_id.split("_")
-            # parts[1] must be a Tuya device ID (≥18 chars) — skip diagnostic/AI entities
             if len(parts) < 2 or len(parts[1]) < 18:
                 continue
             dev_id = parts[1]
@@ -372,7 +394,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.async_on_unload(
         coordinator.async_add_listener(lambda: hass.async_create_task(_cleanup_stale_entities()))
     )
-    hass.async_create_task(_cleanup_stale_entities())
+    await _cleanup_stale_entities()
 
     bridge.start(hass)
     _LOGGER.info(
