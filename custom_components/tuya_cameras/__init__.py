@@ -126,9 +126,6 @@ async def _update_lovelace_views(hass: HomeAssistant) -> None:
             _LOGGER.warning("Lovelace update: no lovelace data in hass.data")
             return
 
-        _LOGGER.debug("Lovelace type=%s attrs=%s", type(lovelace_obj).__name__,
-                      [a for a in dir(lovelace_obj) if not a.startswith("_")])
-
         # Newer HA: LovelaceManager with .dashboards dict
         # Older HA: direct dashboard object or dict
         if hasattr(lovelace_obj, "dashboards"):
@@ -143,7 +140,6 @@ async def _update_lovelace_views(hass: HomeAssistant) -> None:
             return
 
         config_obj = await dashboard.async_load(force=True)
-        _LOGGER.debug("Lovelace config_obj type=%s", type(config_obj).__name__)
         if isinstance(config_obj, dict):
             config = config_obj
         elif hasattr(config_obj, "config") and isinstance(getattr(config_obj, "config", None), dict):
@@ -174,25 +170,37 @@ async def _update_lovelace_views(hass: HomeAssistant) -> None:
         _LOGGER.error("Lovelace update failed: %s", err)
 
 
+def _normalize_cam_title(title: str) -> str:
+    """Normalise a camera title for matching: lowercase, strip accents, strip leading 'camera'."""
+    import unicodedata
+    s = unicodedata.normalize("NFD", title.lower().strip())
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return s.removeprefix("camera ").strip()
+
+
 def _patch_empty_card_entities(view: dict, name_map: dict) -> bool:
     """
-    Walk sections in the Cameras view. For each picture-glance card whose
-    entities list is empty, look up the camera by card title and fill in the
-    SD usage, status, and Format SD Card entity IDs.
-
-    Cards that already have entities are never modified, so manual layouts
-    for Brasil / Winterthur / Farm are preserved.
+    Sync picture-glance cards in the Cameras view:
+    - Remove cards whose camera no longer exists in any coordinator
+    - Fill/correct entity IDs for cards matching a known camera
+      (matches by normalised title — handles 'Panorama Escadas' vs 'Camera Panorama escadas')
     """
+    # Build normalised lookup: stripped title → entity IDs
+    norm_map = {_normalize_cam_title(k): v for k, v in name_map.items()}
+
     changed = False
     for section in view.get("sections", []):
-        for card in section.get("cards", []):
+        cards     = section.get("cards", [])
+        new_cards = []
+        for card in cards:
             if card.get("type") != "picture-glance":
+                new_cards.append(card)
                 continue
-            if card.get("entities"):          # already populated — leave it
-                continue
-            title = card.get("title", "").lower()
-            cam   = name_map.get(title)
-            if not cam:
+            title = card.get("title", "")
+            cam   = norm_map.get(_normalize_cam_title(title))
+            if cam is None:
+                _LOGGER.info("Lovelace: removing card for deleted camera '%s'", title)
+                changed = True
                 continue
             new_entities = [
                 e for e in [
@@ -201,10 +209,13 @@ def _patch_empty_card_entities(view: dict, name_map: dict) -> bool:
                     {"entity": cam["fmt"]}    if cam["fmt"]    else None,
                 ] if e
             ]
-            if new_entities:
+            if new_entities and card.get("entities") != new_entities:
                 card["entities"] = new_entities
-                _LOGGER.debug("Lovelace: filled entities for card '%s'", card.get("title"))
+                _LOGGER.debug("Lovelace: updated entities for card '%s'", title)
                 changed = True
+            new_cards.append(card)
+        if len(new_cards) != len(cards):
+            section["cards"] = new_cards
     return changed
 
 
