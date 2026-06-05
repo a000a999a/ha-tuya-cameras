@@ -65,10 +65,14 @@ class CameraAPI:
             return {}
 
         if not (resp and resp.get("success")):
+            _LOGGER.debug("SD status API failed for %s — resp: %r", device_id, resp)
             return {}
 
         dps = resp.get("result", [])
         total_kb, used_kb = self._parse_sd_storage(dps)
+        if total_kb is None:
+            all_codes = [e.get("code") for e in dps if e.get("code")]
+            _LOGGER.debug("SD storage DPS not found for %s — all codes: %r", device_id, all_codes)
         sd_code = str(self._find_dps(dps, "sd_status") or "")
         sd_status = SD_STATUS_LABELS.get(sd_code, sd_code or "unknown")
 
@@ -98,7 +102,7 @@ class CameraAPI:
     @staticmethod
     def _parse_sd_storage(dps: list) -> tuple[int | None, int | None]:
         for entry in dps:
-            if entry.get("code") == "sd_storge":
+            if entry.get("code") in ("sd_storge", "sd_storage"):
                 try:
                     parts = str(entry["value"]).split("|")
                     return int(parts[0]), int(parts[1])

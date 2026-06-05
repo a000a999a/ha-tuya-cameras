@@ -62,7 +62,8 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 continue
 
             cameras_after = set((cam_coord.data or {}).get("cameras", {}).keys()) if cam_coord else set()
-            new = cameras_after - cameras_before
+            new     = cameras_after - cameras_before
+            removed = cameras_before - cameras_after
             if new:
                 new_cameras_detected = True
                 _LOGGER.info(
@@ -70,6 +71,15 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     len(new), entry_id, new,
                 )
                 hass.async_create_task(hass.config_entries.async_reload(entry_id))
+            if removed:
+                registry = er.async_get(hass)
+                for entity in list(registry.entities.values()):
+                    if entity.config_entry_id != entry_id or entity.platform != DOMAIN:
+                        continue
+                    parts = entity.unique_id.split("_")
+                    if len(parts) >= 2 and parts[1] in removed:
+                        _LOGGER.info("refresh_all: removing stale entity %s (device removed from account)", entity.entity_id)
+                        registry.async_remove(entity.entity_id)
 
         _LOGGER.info("refresh_all: done (%d entries refreshed)", len(entries))
 
@@ -117,7 +127,9 @@ async def _update_lovelace_views(hass: HomeAssistant) -> None:
             _LOGGER.warning("Lovelace update: Overview dashboard not accessible via API")
             return
 
-        config  = await dashboard.async_load(force=True)
+        config_obj = await dashboard.async_load(force=True)
+        # HA may return a LovelaceData object (newer) or a plain dict (older)
+        config  = config_obj.config if hasattr(config_obj, "config") else config_obj
         changed = False
 
         for view in config.get("views", []):
@@ -130,7 +142,7 @@ async def _update_lovelace_views(hass: HomeAssistant) -> None:
                     changed = True
 
         if changed:
-            await dashboard.async_save(config)
+            await dashboard.async_save(config_obj if hasattr(config_obj, "config") else config)
             _LOGGER.info("Lovelace views updated (cameras: %d, ai-detections patched)", len(name_map))
         else:
             _LOGGER.debug("Lovelace update: no changes needed")
@@ -340,6 +352,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+
+    async def _cleanup_stale_entities() -> None:
+        """Remove entity registry entries for cameras no longer in coordinator data."""
+        current_ids = set((coordinator.data or {}).get("cameras", {}).keys())
+        registry = er.async_get(hass)
+        for entity in list(registry.entities.values()):
+            if entity.config_entry_id != entry.entry_id or entity.platform != DOMAIN:
+                continue
+            parts = entity.unique_id.split("_")
+            # parts[1] must be a Tuya device ID (≥18 chars) — skip diagnostic/AI entities
+            if len(parts) < 2 or len(parts[1]) < 18:
+                continue
+            dev_id = parts[1]
+            if dev_id not in current_ids:
+                _LOGGER.info("Removing stale entity %s (device %s removed from account)", entity.entity_id, dev_id)
+                registry.async_remove(entity.entity_id)
+
+    entry.async_on_unload(
+        coordinator.async_add_listener(lambda: hass.async_create_task(_cleanup_stale_entities()))
+    )
+    hass.async_create_task(_cleanup_stale_entities())
 
     bridge.start(hass)
     _LOGGER.info(
