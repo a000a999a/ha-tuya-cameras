@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import time
@@ -30,8 +31,11 @@ from .notify import Notifier
 
 _LOGGER = logging.getLogger(__name__)
 
-RECONNECT_BUFFER_S = 600   # refresh creds 10 min before expiry
-RETRY_DELAY_S      = 30
+RECONNECT_BUFFER_S   = 600   # refresh creds 10 min before expiry
+RETRY_DELAY_S        = 30
+WATCHDOG_SILENCE_S   = 3600  # tech alert after 1 h with no MQTT messages
+WATCHDOG_CHECK_S     = 300   # check every 5 min
+TECH_ALERT_COOLDOWN  = 1800  # suppress duplicate tech alerts for 30 min
 
 
 class TuyaMQTTBridge:
@@ -61,20 +65,24 @@ class TuyaMQTTBridge:
         self._ai_client      = ai_client   # None = AI disabled
         self._ai_stats       = ai_stats
         self._task: asyncio.Task | None = None
+        self._watchdog_task: asyncio.Task | None = None
         self._local_keys: dict[str, str] = {}    # device_id → local_key
         self._product_ids: dict[str, str] = {}  # device_id → product_id (for v4 blob decrypt)
         self._uuids: dict[str, str] = {}         # device_id → uuid
+        self._last_msg_at: float = time.monotonic()
+        self._last_tech_alert_at: float = 0.0
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self, hass: Any) -> None:
-        self._task = hass.async_create_background_task(
-            self._run(), "tuya_cameras_mqtt_bridge"
-        )
+        self._task          = hass.async_create_background_task(self._run(),      "tuya_cameras_mqtt_bridge")
+        self._watchdog_task = hass.async_create_background_task(self._watchdog(), "tuya_cameras_mqtt_watchdog")
 
     def stop(self) -> None:
         if self._task:
             self._task.cancel()
+        if self._watchdog_task:
+            self._watchdog_task.cancel()
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -87,6 +95,10 @@ class TuyaMQTTBridge:
                 creds = await self._hass.async_add_executor_job(self._fetch_creds)
                 if not creds:
                     _LOGGER.error("MQTT credentials unavailable — retrying in %ds", RETRY_DELAY_S)
+                    await self._send_tech_alert(
+                        "MQTT credentials unavailable",
+                        "Could not fetch MQTT credentials from Tuya API. Bridge will retry automatically.",
+                    )
                     await asyncio.sleep(RETRY_DELAY_S)
                     continue
 
@@ -101,6 +113,10 @@ class TuyaMQTTBridge:
 
                 client = await self._hass.async_add_executor_job(self._connect, creds)
                 if client is None:
+                    await self._send_tech_alert(
+                        "MQTT connection failed",
+                        "Could not connect to Tuya MQTT broker. Bridge will retry automatically.",
+                    )
                     await asyncio.sleep(RETRY_DELAY_S)
                     continue
 
@@ -137,6 +153,7 @@ class TuyaMQTTBridge:
                 return
             except Exception as err:
                 _LOGGER.error("MQTT bridge error: %s — retrying in %ds", err, RETRY_DELAY_S)
+                await self._send_tech_alert("MQTT bridge error", f"Bridge encountered an error and will retry: {err}")
                 await asyncio.sleep(RETRY_DELAY_S)
 
     # ── Connection helpers (blocking — called via executor) ───────────────────
@@ -268,6 +285,7 @@ class TuyaMQTTBridge:
     # ── Message handling (async, on HA event loop) ────────────────────────────
 
     async def _handle(self, payload: bytes, key: bytes, full_password: str = "") -> None:
+        self._last_msg_at = time.monotonic()  # watchdog heartbeat
         try:
             envelope = json.loads(payload)
         except Exception:
@@ -367,6 +385,7 @@ class TuyaMQTTBridge:
 
         if not img_bytes:
             _LOGGER.debug("Motion %s/%s: no OSS image — trying HA snapshot(s)", area, name)
+            snap_hashes: list[str] = []
             for attempt, delay in enumerate((0, 2, 4)):
                 if delay:
                     await asyncio.sleep(delay)
@@ -374,6 +393,7 @@ class TuyaMQTTBridge:
                 if not snap:
                     _LOGGER.debug("Motion %s/%s: snapshot %d/3 failed", area, name, attempt + 1)
                     continue
+                snap_hashes.append(hashlib.md5(snap).hexdigest())
                 snap_age  = age_s + delay
                 snap_note = f"live snapshot ({snap_age:.0f}s after event — person may have left)"
                 _LOGGER.debug("Motion %s/%s: snapshot at +%ds ok (age %.0fs)", area, name, delay, snap_age)
@@ -396,7 +416,20 @@ class TuyaMQTTBridge:
                     )
                     break
                 if delay == 4:
-                    # Last attempt — discard cleanly without re-running AI below
+                    # All attempts exhausted — check for stale RTSP frame before discarding
+                    if len(snap_hashes) == 3 and len(set(snap_hashes)) == 1:
+                        _LOGGER.warning(
+                            "Motion %s/%s: all 3 snapshots identical (md5=%s) — RTSP stream serving stale frame",
+                            area, name, snap_hashes[0],
+                        )
+                        await self._send_tech_alert(
+                            f"Stale RTSP snapshot — {name}",
+                            f"Motion at <b>{name}</b> ({area}) at {ev_ts}.<br><br>"
+                            f"All 3 snapshots were byte-for-byte identical, meaning the RTSP stream "
+                            f"was buffering a stale frame (likely Tuya token expiry at time of motion). "
+                            f"No alert was sent to human recipients.<br><br>"
+                            f"Check SmartLife for the actual recording.",
+                        )
                     _LOGGER.debug(
                         "Motion %s/%s: no human at +%ds (conf=%.2f) — all attempts exhausted",
                         area, name, delay, result["confidence"],
@@ -505,6 +538,57 @@ class TuyaMQTTBridge:
         import re
         raw = self._recipients_cfg.get(area, {}).get(kind, "")
         return [r.strip() for r in re.split(r"[;,]", raw) if r.strip()]
+
+    def _get_all_tech_recipients(self) -> list[str]:
+        import re
+        addrs: set[str] = set()
+        for area_cfg in self._recipients_cfg.values():
+            raw = area_cfg.get("tech", "")
+            for r in re.split(r"[;,]", raw):
+                r = r.strip()
+                if r:
+                    addrs.add(r)
+        return list(addrs)
+
+    async def _send_tech_alert(self, subject: str, detail: str) -> None:
+        """Send a tech alert email — rate-limited to once per 30 min."""
+        now = time.monotonic()
+        if now - self._last_tech_alert_at < TECH_ALERT_COOLDOWN:
+            _LOGGER.debug("Tech alert suppressed (rate-limit): %s", subject)
+            return
+        self._last_tech_alert_at = now
+        to = self._get_all_tech_recipients()
+        if not to:
+            _LOGGER.warning("Tech alert '%s' — no tech recipients configured", subject)
+            return
+        body = (
+            f"<html><body>"
+            f"<h2 style='color:#c0392b;'>{subject}</h2>"
+            f"<p>{detail}</p>"
+            f"<p style='color:#888;font-size:0.9em;'>Home Assistant / tuya_cameras</p>"
+            f"</body></html>"
+        )
+        await self._hass.async_add_executor_job(
+            self._notifier.send, f"[HA Cameras] {subject}", body, to, None
+        )
+        _LOGGER.info("Tech alert sent: %s → %s", subject, to)
+
+    async def _watchdog(self) -> None:
+        """Send a tech alert if no MQTT messages received for WATCHDOG_SILENCE_S seconds."""
+        while True:
+            try:
+                await asyncio.sleep(WATCHDOG_CHECK_S)
+                silence = time.monotonic() - self._last_msg_at
+                if silence > WATCHDOG_SILENCE_S:
+                    await self._send_tech_alert(
+                        "MQTT bridge silent",
+                        f"No MQTT messages received for {silence / 60:.0f} minutes. "
+                        f"The bridge may be disconnected or Tuya broker may have stopped pushing events.",
+                    )
+            except asyncio.CancelledError:
+                return
+            except Exception as err:
+                _LOGGER.debug("Watchdog loop error: %s", err)
 
     @staticmethod
     def _decrypt(data: Any, key: bytes) -> dict:
