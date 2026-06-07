@@ -336,7 +336,8 @@ class TuyaMQTTBridge:
             product_id=self._product_ids.get(dev_id, ""),
             device_uuid=self._uuids.get(dev_id, ""),
         )
-        age_s     = (time.time() * 1000 - t_ms) / 1000
+        age_s  = (time.time() * 1000 - t_ms) / 1000
+        ev_ts  = datetime.fromtimestamp(t_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         _LOGGER.debug(
             "Motion %s/%s: code=%s bucket=%r files=%r",
@@ -417,18 +418,22 @@ class TuyaMQTTBridge:
                     )
                     break
                 if delay == 4:
-                    # All attempts exhausted — check for stale RTSP frame before discarding
-                    if len(snap_hashes) == 3 and len(set(snap_hashes)) == 1:
+                    # All attempts exhausted — check for stale RTSP frame before discarding.
+                    # Applies universally: Brasil v4.0, Brasil ?param=, Wallis, Camera Door —
+                    # any camera that ends up in the snapshot path can hit this.
+                    # Threshold ≥2 so a single failed snapshot doesn't mask the stale condition.
+                    if len(snap_hashes) >= 2 and len(set(snap_hashes)) == 1:
                         _LOGGER.warning(
                             "Motion %s/%s: all 3 snapshots identical (md5=%s) — RTSP stream serving stale frame",
                             area, name, snap_hashes[0],
                         )
                         await self._send_tech_alert(
-                            f"Stale RTSP snapshot — {name}",
+                            f"Stale RTSP — {area}/{name}",
                             f"Motion at <b>{name}</b> ({area}) at {ev_ts}.<br><br>"
-                            f"All 3 snapshots were byte-for-byte identical — RTSP stream was buffering "
-                            f"a stale frame (Tuya token expiry at time of motion). "
-                            f"Attempting autonomous stream recovery (update_entity + 15s reconnect window).",
+                            f"{len(snap_hashes)} of 3 snapshots were byte-for-byte identical — "
+                            f"RTSP stream is buffering a stale pre-event frame "
+                            f"(Tuya token expiry window). Attempting autonomous heal "
+                            f"(update_entity → 15 s reconnect → retry snapshot + AI).",
                         )
                         heal_result = await self._try_rtsp_heal(cam_entity_id, dev_id, snap, area, name)
                         if heal_result:
@@ -453,8 +458,6 @@ class TuyaMQTTBridge:
                     area, name,
                 )
                 return
-
-        ev_ts = datetime.fromtimestamp(t_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         # ── AI filtering ──────────────────────────────────────────────────────
         email_image = img_bytes  # may be replaced with annotated image
