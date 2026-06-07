@@ -385,11 +385,12 @@ class TuyaMQTTBridge:
 
         if not img_bytes:
             _LOGGER.debug("Motion %s/%s: no OSS image — trying HA snapshot(s)", area, name)
+            cam_entity_id = await self._find_camera_entity_id(dev_id)
             snap_hashes: list[str] = []
             for attempt, delay in enumerate((0, 2, 4)):
                 if delay:
                     await asyncio.sleep(delay)
-                snap = await self._get_ha_snapshot(dev_id)
+                snap = await self._get_ha_snapshot(dev_id, cam_entity_id)
                 if not snap:
                     _LOGGER.debug("Motion %s/%s: snapshot %d/3 failed", area, name, attempt + 1)
                     continue
@@ -425,11 +426,15 @@ class TuyaMQTTBridge:
                         await self._send_tech_alert(
                             f"Stale RTSP snapshot — {name}",
                             f"Motion at <b>{name}</b> ({area}) at {ev_ts}.<br><br>"
-                            f"All 3 snapshots were byte-for-byte identical, meaning the RTSP stream "
-                            f"was buffering a stale frame (likely Tuya token expiry at time of motion). "
-                            f"No alert was sent to human recipients.<br><br>"
-                            f"Check SmartLife for the actual recording.",
+                            f"All 3 snapshots were byte-for-byte identical — RTSP stream was buffering "
+                            f"a stale frame (Tuya token expiry at time of motion). "
+                            f"Attempting autonomous stream recovery (update_entity + 15s reconnect window).",
                         )
+                        heal_result = await self._try_rtsp_heal(cam_entity_id, dev_id, snap, area, name)
+                        if heal_result:
+                            img_bytes, prefetched_ai = heal_result
+                            snap_note = "recovered snapshot after autonomous RTSP stream heal"
+                            break   # exit snapshot loop → fall through to AI filtering + email
                     _LOGGER.debug(
                         "Motion %s/%s: no human at +%ds (conf=%.2f) — all attempts exhausted",
                         area, name, delay, result["confidence"],
@@ -508,30 +513,95 @@ class TuyaMQTTBridge:
             )
             _LOGGER.info("Motion alert sent for %s/%s to %s", area, name, to_addrs)
 
-    async def _get_ha_snapshot(self, dev_id: str) -> bytes | None:
-        """Fetch a live snapshot from the HA camera entity for this Tuya device."""
+    async def _find_camera_entity_id(self, dev_id: str) -> str | None:
+        """Look up the HA camera entity ID for a Tuya device ID."""
         try:
             from homeassistant.helpers import entity_registry as er
-            from homeassistant.components.camera import async_get_image
-
-            registry  = er.async_get(self._hass)
-            entity_id = None
+            registry = er.async_get(self._hass)
             for entry in registry.entities.values():
                 uid = entry.unique_id or ""
                 if entry.entity_id.startswith("camera.") and (
                     uid == f"tuya.{dev_id}" or uid == dev_id
                 ):
-                    entity_id = entry.entity_id
-                    break
+                    return entry.entity_id
+        except Exception:
+            pass
+        return None
 
+    async def _get_ha_snapshot(self, dev_id: str, entity_id: str | None = None) -> bytes | None:
+        """Fetch a live snapshot from the HA camera entity for this Tuya device."""
+        try:
+            from homeassistant.components.camera import async_get_image
+            if entity_id is None:
+                entity_id = await self._find_camera_entity_id(dev_id)
             if not entity_id:
                 _LOGGER.debug("No HA camera entity found for device %s", dev_id)
                 return None
-
             image = await async_get_image(self._hass, entity_id, timeout=10)
             return image.content
         except Exception as err:
             _LOGGER.warning("HA snapshot failed for device %s (%s): %s", dev_id, entity_id or "?", err)
+            return None
+
+    async def _try_rtsp_heal(
+        self,
+        entity_id: str | None,
+        dev_id: str,
+        stale_snap: bytes,
+        area: str,
+        name: str,
+    ) -> tuple[bytes, dict | None] | None:
+        """Attempt autonomous RTSP recovery after stale-frame detection.
+
+        Calls homeassistant.update_entity to trigger an RTSP URL refresh in go2rtc,
+        waits 15s for reconnection, then takes one more snapshot.
+        Returns (image_bytes, ai_result) if a human is found, else None.
+        """
+        if not entity_id:
+            _LOGGER.debug("Motion %s/%s: RTSP heal skipped — no camera entity", area, name)
+            return None
+        try:
+            _LOGGER.info(
+                "Motion %s/%s: stale RTSP — calling update_entity on %s to force stream refresh",
+                area, name, entity_id,
+            )
+            await self._hass.services.async_call(
+                "homeassistant", "update_entity",
+                {"entity_id": entity_id},
+                blocking=True,
+            )
+            await asyncio.sleep(15)   # give go2rtc time to reconnect with fresh RTSP URL
+
+            snap = await self._get_ha_snapshot(dev_id, entity_id)
+            if not snap:
+                _LOGGER.info("Motion %s/%s: RTSP heal snapshot failed", area, name)
+                return None
+
+            if hashlib.md5(snap).hexdigest() == hashlib.md5(stale_snap).hexdigest():
+                _LOGGER.info("Motion %s/%s: RTSP heal snapshot still identical — stream not recovered yet", area, name)
+                return None
+
+            _LOGGER.info("Motion %s/%s: RTSP heal snapshot is fresh — running AI", area, name)
+            if self._ai_client is None:
+                return (snap, None)   # AI disabled — return image, caller decides
+
+            result = await self._ai_client.analyze(snap)
+            if result is None:
+                # AI unreachable — fail-open, return image so caller emails it
+                return (snap, None)
+            if result["human"]:
+                _LOGGER.info(
+                    "Motion %s/%s: RTSP heal — human detected (conf=%.2f) — sending alert",
+                    area, name, result["confidence"],
+                )
+                return (snap, result)
+            _LOGGER.info(
+                "Motion %s/%s: RTSP heal — no human in recovered snapshot (conf=%.2f) — discarding",
+                area, name, result["confidence"],
+            )
+            return None
+        except Exception as err:
+            _LOGGER.debug("Motion %s/%s: RTSP heal attempt failed: %s", area, name, err)
             return None
 
     def _get_recipients(self, area: str, kind: str) -> list[str]:
