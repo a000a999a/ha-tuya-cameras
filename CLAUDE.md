@@ -33,6 +33,16 @@ against a 26,000/month quota (23× daily budget). It was disabled 2026-05-22.
 - Use `cryptography` library (in requirements) — NOT pycryptodome (not installed in HA)
 - file_key from DPS payload: hex string (32 chars → bytes.fromhex) or ASCII padded to 16 bytes
 
+## Universal Coverage Rule
+Every fix to the motion pipeline must be validated against ALL snapshot-path camera types:
+- Brasil v4.0 initiative_message — always snapshot (no OSS)
+- Brasil movement_detect_pic ?param= CDN — always snapshot (403 on CDN)
+- Wallis v4.0 initiative_message — always snapshot (no OSS)
+- Winterthur Camera Door movement_detect_pic ?param= — always snapshot
+- Winterthur other cameras (clean key) — OSS usually works; snapshot is fallback
+Cameras that get OSS images are unaffected by snapshot-path fixes (correct by design).
+When adding any logic inside the snapshot loop: verify it uses no variables defined after the loop.
+
 ## Checklist Additions
 - [ ] NEVER call gw.status() anywhere in this repo
 - [ ] NEVER add getdevicelog, getdevices, or any polling loop to motion detection
