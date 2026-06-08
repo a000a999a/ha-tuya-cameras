@@ -406,6 +406,14 @@ class TuyaMQTTBridge:
                     "Motion %s/%s: snapshot at +%ds ok (age %.0fs, size=%d bytes, entity=%s)",
                     area, name, delay, snap_age, len(snap), cam_entity_id or "None",
                 )
+                _dbg = (
+                    f"/config/debug_snapshots/snap_{ev_ts.replace(':', '-').replace(' ', '_')}"
+                    f"_{area}_{name}_+{delay}s.jpg".replace(" ", "_")
+                )
+                _snap_copy = snap
+                self._hass.async_add_executor_job(
+                    lambda p=_dbg, d=_snap_copy: open(p, "wb").write(d)
+                )
 
                 if self._ai_client is None:
                     img_bytes = snap
