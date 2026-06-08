@@ -1,7 +1,7 @@
 {
   "domain": "tuya_cameras",
   "name": "Tuya Cameras",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "documentation": "https://github.com/a000a999a/ha-tuya-cameras",
   "issue_tracker": "https://github.com/a000a999a/ha-tuya-cameras/issues",
   "requirements": [
