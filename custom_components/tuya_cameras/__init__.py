@@ -236,18 +236,30 @@ def _patch_cameras_view(view: dict, cam_info: dict) -> bool:
         if len(new_cards) != len(cards):
             section["cards"] = new_cards
 
-    # ── Pass 2: infer section → area mapping from existing cards ──────────
-    # This avoids hardcoding area-name ↔ section-heading mappings (e.g. "Winti" vs "Winterthur").
+    # ── Pass 2: infer section → area mapping ─────────────────────────────
+    # Primary: find a picture-glance card whose camera has a known area
+    #   (avoids hardcoding heading ↔ area mismatches like "Winti" vs "Winterthur").
+    # Fallback: match heading text to a known area name
+    #   (handles sections left empty after camera removals, e.g. "Farm" section).
     section_area: dict[int, str] = {}   # section_index → area name
+    known_areas = {v["area"].lower(): v["area"] for v in cam_info.values() if v.get("area")}
     for i, section in enumerate(view.get("sections", [])):
         for card in section.get("cards", []):
-            if card.get("type") != "picture-glance":
-                continue
-            norm = _normalize_cam_title(card.get("title", ""))
-            cam  = norm_map.get(norm)
-            if cam and cam.get("area"):
-                section_area[i] = cam["area"]
-                break
+            if card.get("type") == "picture-glance":
+                norm = _normalize_cam_title(card.get("title", ""))
+                cam  = norm_map.get(norm)
+                if cam and cam.get("area"):
+                    section_area[i] = cam["area"]
+                    break
+        if i in section_area:
+            continue
+        # Fallback: match heading text to a known area name (case-insensitive)
+        for card in section.get("cards", []):
+            if card.get("type") == "heading":
+                heading_lc = card.get("heading", "").strip().lower()
+                if heading_lc in known_areas:
+                    section_area[i] = known_areas[heading_lc]
+                    break
 
     # ── Pass 3: add cards for missing cameras ─────────────────────────────
     for cam_key, cam in cam_info.items():
