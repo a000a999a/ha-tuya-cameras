@@ -71,6 +71,9 @@ class TuyaMQTTBridge:
         self._uuids: dict[str, str] = {}         # device_id → uuid
         self._last_msg_at: float = time.monotonic()
         self._last_tech_alert_at: float = 0.0
+        self._go2rtc_sock: str | None = None       # cached on first use
+        self._go2rtc_user: str | None = None
+        self._go2rtc_pass: str | None = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -402,14 +405,12 @@ class TuyaMQTTBridge:
                     "Motion %s/%s: snapshot at +%ds ok (age %.0fs, size=%d bytes, entity=%s)",
                     area, name, delay, snap_age, len(snap), cam_entity_id or "None",
                 )
-                # DEBUG: save snapshot to /tmp for visual inspection of conf=0.00 cases
-                try:
-                    import os as _os
-                    _dbg = f"/tmp/snap_debug_{area}_{name}_+{delay}s.jpg".replace(" ", "_")
-                    with open(_dbg, "wb") as _f:
-                        _f.write(snap)
-                except Exception:
-                    pass
+                # Save snapshot to /tmp for visual inspection of conf=0.00 cases (non-blocking)
+                _dbg = f"/tmp/snap_debug_{area}_{name}_+{delay}s.jpg".replace(" ", "_")
+                _snap_copy = snap
+                self._hass.async_add_executor_job(
+                    lambda p=_dbg, d=_snap_copy: open(p, "wb").write(d)
+                )
 
                 if self._ai_client is None:
                     img_bytes = snap
@@ -643,41 +644,50 @@ class TuyaMQTTBridge:
             _LOGGER.debug("Motion %s/%s: RTSP heal attempt failed: %s", area, name, err)
             return None
 
+    def _load_go2rtc_credentials(self) -> bool:
+        """Discover go2rtc socket path and credentials (blocking — run via executor).
+        Returns True if found, caches results in self._go2rtc_sock/user/pass.
+        """
+        import glob, re
+        sockets = glob.glob("/tmp/go2rtc-*/go2rtc.sock")
+        if not sockets:
+            return False
+        self._go2rtc_sock = sockets[0]
+        for cfg_path in glob.glob("/tmp/go2rtc-*/go2rtc_*.yaml"):
+            try:
+                with open(cfg_path) as f:
+                    text = f.read()
+                m = re.search(r"^\s*username:\s+(\S+)", text, re.MULTILINE)
+                if m:
+                    self._go2rtc_user = m.group(1)
+                m = re.search(r"^\s*password:\s+(\S+)", text, re.MULTILINE)
+                if m:
+                    self._go2rtc_pass = m.group(1)
+                if self._go2rtc_user:
+                    break
+            except Exception:
+                pass
+        return True
+
     async def _check_go2rtc_stream_alive(self, cam_entity_id: str | None) -> bool:
-        """Return True if go2rtc is serving live frames for the camera, False if the stream is dead.
+        """Return True if go2rtc is serving live frames for the camera, False if dead.
 
         Uses go2rtc's Unix-socket API (/api/frame.jpeg) with a 2-second timeout.
-        Fails open (returns True) if the socket or credentials cannot be found.
+        Credentials are discovered once and cached. Fails open on any error.
         """
         if not cam_entity_id:
             return True
         try:
-            import glob, re
             import aiohttp
+            # Load credentials via executor on first call (avoids blocking event loop)
+            if self._go2rtc_sock is None:
+                found = await self._hass.async_add_executor_job(self._load_go2rtc_credentials)
+                if not found or not self._go2rtc_sock:
+                    return True  # go2rtc socket not found — assume alive
 
-            sockets = glob.glob("/tmp/go2rtc-*/go2rtc.sock")
-            if not sockets:
-                return True
-
-            username = password = None
-            for cfg_path in glob.glob("/tmp/go2rtc-*/go2rtc_*.yaml"):
-                try:
-                    with open(cfg_path) as f:
-                        text = f.read()
-                    m = re.search(r"^\s*username:\s+(\S+)", text, re.MULTILINE)
-                    if m:
-                        username = m.group(1)
-                    m = re.search(r"^\s*password:\s+(\S+)", text, re.MULTILINE)
-                    if m:
-                        password = m.group(1)
-                    if username:
-                        break
-                except Exception:
-                    pass
-
-            auth = aiohttp.BasicAuth(username, password) if username else None
-            connector = aiohttp.UnixConnector(path=sockets[0])
-            timeout = aiohttp.ClientTimeout(total=2)
+            auth = aiohttp.BasicAuth(self._go2rtc_user, self._go2rtc_pass) if self._go2rtc_user else None
+            connector = aiohttp.UnixConnector(path=self._go2rtc_sock)
+            timeout   = aiohttp.ClientTimeout(total=2)
             async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(
                     f"http://localhost/api/frame.jpeg?src={cam_entity_id}",

@@ -97,27 +97,43 @@ async def _update_lovelace_views(hass: HomeAssistant) -> None:
     """
     Update both the Cameras view and the AI Detections view in the Overview dashboard.
 
-    Cameras view: fills picture-glance card entities for cards with empty entities.
+    Cameras view:
+    - Updates entity IDs in existing picture-glance cards.
+    - Adds a new picture-glance card for every camera that has no card yet,
+      inserting it into the section that already contains other cameras from
+      the same area (or a new section if none exists).
+    - Removes cards for cameras that no longer exist in any coordinator.
     AI Detections view: rebuilds Last Human Detection tiles for all known areas;
       adds missing Live Counts / 7-Day Summary stats for new tuya_cameras entries.
     """
     registry    = er.async_get(hass)
     domain_data = hass.data.get(DOMAIN, {})
 
-    # Build: lowercase camera name → entity IDs (for Cameras view)
-    name_map: dict[str, dict] = {}
+    # Build: lowercase camera name → {entity IDs, area, camera entity_id}
+    cam_info: dict[str, dict] = {}
     for entry_id, data in domain_data.items():
         cam_data = (data.get("coordinator").data or {}).get("cameras", {})
         for dev_id, cam in cam_data.items():
             name = cam.get("name", "").strip()
+            area = cam.get("area", "").strip()
             if not name:
                 continue
             sd_eid     = registry.async_get_entity_id("sensor", DOMAIN, f"{entry_id}_{dev_id}_sd_pct")
             online_eid = registry.async_get_entity_id("sensor", DOMAIN, f"{entry_id}_{dev_id}_online")
             fmt_eid    = registry.async_get_entity_id("button", DOMAIN, f"{entry_id}_{dev_id}_format_sd")
+            # Find the official HA camera entity (created by the Tuya integration)
+            cam_entity = None
+            for entry in registry.entities.values():
+                uid = entry.unique_id or ""
+                if entry.entity_id.startswith("camera.") and (
+                    uid == f"tuya.{dev_id}" or uid == dev_id
+                ):
+                    cam_entity = entry.entity_id
+                    break
             if sd_eid or online_eid:
-                name_map[name.lower()] = {
+                cam_info[name.lower()] = {
                     "sd": sd_eid, "online": online_eid, "fmt": fmt_eid,
+                    "area": area, "camera_entity": cam_entity, "name": name,
                 }
 
     try:
@@ -153,8 +169,8 @@ async def _update_lovelace_views(hass: HomeAssistant) -> None:
 
         for view in config.get("views", []):
             path = view.get("path", "")
-            if path == "cameras" and name_map:
-                if _patch_empty_card_entities(view, name_map):
+            if path == "cameras" and cam_info:
+                if _patch_cameras_view(view, cam_info):
                     changed = True
             elif path == "ai-detections":
                 if _patch_ai_detections_view(view, registry):
@@ -162,7 +178,7 @@ async def _update_lovelace_views(hass: HomeAssistant) -> None:
 
         if changed:
             await dashboard.async_save(config)
-            _LOGGER.info("Lovelace views updated (cameras: %d, ai-detections patched)", len(name_map))
+            _LOGGER.info("Lovelace views updated (cameras: %d, ai-detections patched)", len(cam_info))
         else:
             _LOGGER.debug("Lovelace update: no changes needed")
 
@@ -178,17 +194,20 @@ def _normalize_cam_title(title: str) -> str:
     return s.removeprefix("camera ").strip()
 
 
-def _patch_empty_card_entities(view: dict, name_map: dict) -> bool:
+def _patch_cameras_view(view: dict, cam_info: dict) -> bool:
     """
     Sync picture-glance cards in the Cameras view:
-    - Remove cards whose camera no longer exists in any coordinator
-    - Fill/correct entity IDs for cards matching a known camera
-      (matches by normalised title — handles 'Panorama Escadas' vs 'Camera Panorama escadas')
+    - Update entity IDs for existing cards.
+    - Remove cards for cameras no longer in any coordinator.
+    - Add new picture-glance cards for cameras that have no card yet,
+      placed in the section that already contains cameras from the same area.
+      If no such section exists, a new section is created.
     """
-    # Build normalised lookup: stripped title → entity IDs
-    norm_map = {_normalize_cam_title(k): v for k, v in name_map.items()}
+    norm_map = {_normalize_cam_title(k): v for k, v in cam_info.items()}
+    changed  = False
 
-    changed = False
+    # ── Pass 1: update / remove existing cards ────────────────────────────
+    cameras_with_cards: set[str] = set()   # normalised titles already in the view
     for section in view.get("sections", []):
         cards     = section.get("cards", [])
         new_cards = []
@@ -196,19 +215,19 @@ def _patch_empty_card_entities(view: dict, name_map: dict) -> bool:
             if card.get("type") != "picture-glance":
                 new_cards.append(card)
                 continue
-            title = card.get("title", "")
-            cam   = norm_map.get(_normalize_cam_title(title))
+            title    = card.get("title", "")
+            norm     = _normalize_cam_title(title)
+            cam      = norm_map.get(norm)
             if cam is None:
                 _LOGGER.info("Lovelace: removing card for deleted camera '%s'", title)
                 changed = True
                 continue
-            new_entities = [
-                e for e in [
-                    {"entity": cam["sd"]}     if cam["sd"]     else None,
-                    {"entity": cam["online"]} if cam["online"] else None,
-                    {"entity": cam["fmt"]}    if cam["fmt"]    else None,
-                ] if e
-            ]
+            cameras_with_cards.add(norm)
+            new_entities = [e for e in [
+                {"entity": cam["sd"]}     if cam["sd"]     else None,
+                {"entity": cam["online"]} if cam["online"] else None,
+                {"entity": cam["fmt"]}    if cam["fmt"]    else None,
+            ] if e]
             if new_entities and card.get("entities") != new_entities:
                 card["entities"] = new_entities
                 _LOGGER.debug("Lovelace: updated entities for card '%s'", title)
@@ -216,6 +235,62 @@ def _patch_empty_card_entities(view: dict, name_map: dict) -> bool:
             new_cards.append(card)
         if len(new_cards) != len(cards):
             section["cards"] = new_cards
+
+    # ── Pass 2: infer section → area mapping from existing cards ──────────
+    # This avoids hardcoding area-name ↔ section-heading mappings (e.g. "Winti" vs "Winterthur").
+    section_area: dict[int, str] = {}   # section_index → area name
+    for i, section in enumerate(view.get("sections", [])):
+        for card in section.get("cards", []):
+            if card.get("type") != "picture-glance":
+                continue
+            norm = _normalize_cam_title(card.get("title", ""))
+            cam  = norm_map.get(norm)
+            if cam and cam.get("area"):
+                section_area[i] = cam["area"]
+                break
+
+    # ── Pass 3: add cards for missing cameras ─────────────────────────────
+    for cam_key, cam in cam_info.items():
+        if _normalize_cam_title(cam_key) in cameras_with_cards:
+            continue
+        if not cam.get("camera_entity"):
+            _LOGGER.debug(
+                "Lovelace: skipping new card for '%s' — no camera entity yet (HA restart may be needed)",
+                cam.get("name", cam_key),
+            )
+            continue
+
+        area = cam.get("area", "")
+        # Find existing section for this area
+        target_idx = next(
+            (i for i, a in section_area.items() if a == area),
+            None,
+        )
+        sections = view.setdefault("sections", [])
+        if target_idx is None:
+            # Create a new section with an area heading
+            sections.append({"cards": [{"type": "heading", "heading": area}]})
+            target_idx = len(sections) - 1
+            section_area[target_idx] = area
+
+        new_card = {
+            "type": "picture-glance",
+            "title": cam["name"],
+            "camera_image": cam["camera_entity"],
+            "camera_view": "live",
+            "entities": [e for e in [
+                {"entity": cam["sd"]}     if cam["sd"]     else None,
+                {"entity": cam["online"]} if cam["online"] else None,
+                {"entity": cam["fmt"]}    if cam["fmt"]    else None,
+            ] if e],
+        }
+        sections[target_idx]["cards"].append(new_card)
+        _LOGGER.info(
+            "Lovelace: added picture-glance card for new camera '%s' (area=%s, entity=%s)",
+            cam["name"], area, cam["camera_entity"],
+        )
+        changed = True
+
     return changed
 
 
