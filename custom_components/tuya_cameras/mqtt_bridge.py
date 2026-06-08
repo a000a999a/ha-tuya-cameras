@@ -398,7 +398,18 @@ class TuyaMQTTBridge:
                 snap_hashes.append(hashlib.md5(snap).hexdigest())
                 snap_age  = age_s + delay
                 snap_note = f"live snapshot ({snap_age:.0f}s after event — person may have left)"
-                _LOGGER.debug("Motion %s/%s: snapshot at +%ds ok (age %.0fs)", area, name, delay, snap_age)
+                _LOGGER.debug(
+                    "Motion %s/%s: snapshot at +%ds ok (age %.0fs, size=%d bytes, entity=%s)",
+                    area, name, delay, snap_age, len(snap), cam_entity_id or "None",
+                )
+                # DEBUG: save snapshot to /tmp for visual inspection of conf=0.00 cases
+                try:
+                    import os as _os
+                    _dbg = f"/tmp/snap_debug_{area}_{name}_+{delay}s.jpg".replace(" ", "_")
+                    with open(_dbg, "wb") as _f:
+                        _f.write(snap)
+                except Exception:
+                    pass
 
                 if self._ai_client is None:
                     img_bytes = snap
@@ -440,6 +451,31 @@ class TuyaMQTTBridge:
                             img_bytes, prefetched_ai = heal_result
                             snap_note = "recovered snapshot after autonomous RTSP stream heal"
                             break   # exit snapshot loop → fall through to AI filtering + email
+                    elif len(snap_hashes) >= 2:
+                        # Second stale-detection path: frames have different MD5 (timestamp overlay
+                        # or minor encoding difference) but go2rtc stream is dead — it serves cached
+                        # frames from its buffer which look slightly different each time.
+                        # Only trigger if go2rtc confirms the stream is not delivering live frames.
+                        stream_alive = await self._check_go2rtc_stream_alive(cam_entity_id)
+                        if not stream_alive:
+                            _LOGGER.warning(
+                                "Motion %s/%s: conf=0.00 on all snapshots + go2rtc stream dead "
+                                "— RTSP token likely expired, attempting autonomous heal",
+                                area, name,
+                            )
+                            await self._send_tech_alert(
+                                f"Dead RTSP stream — {area}/{name}",
+                                f"Motion at <b>{name}</b> ({area}) at {ev_ts}.<br><br>"
+                                f"All 3 snapshots returned conf=0.00 and go2rtc confirmed the "
+                                f"stream is not delivering live frames (RTSP token expired). "
+                                f"Attempting autonomous heal "
+                                f"(update_entity → 15 s reconnect → retry snapshot + AI).",
+                            )
+                            heal_result = await self._try_rtsp_heal(cam_entity_id, dev_id, snap, area, name)
+                            if heal_result:
+                                img_bytes, prefetched_ai = heal_result
+                                snap_note = "recovered snapshot after autonomous RTSP stream heal (dead stream)"
+                                break
                     _LOGGER.debug(
                         "Motion %s/%s: no human at +%ds (conf=%.2f) — all attempts exhausted",
                         area, name, delay, result["confidence"],
@@ -606,6 +642,52 @@ class TuyaMQTTBridge:
         except Exception as err:
             _LOGGER.debug("Motion %s/%s: RTSP heal attempt failed: %s", area, name, err)
             return None
+
+    async def _check_go2rtc_stream_alive(self, cam_entity_id: str | None) -> bool:
+        """Return True if go2rtc is serving live frames for the camera, False if the stream is dead.
+
+        Uses go2rtc's Unix-socket API (/api/frame.jpeg) with a 2-second timeout.
+        Fails open (returns True) if the socket or credentials cannot be found.
+        """
+        if not cam_entity_id:
+            return True
+        try:
+            import glob, re
+            import aiohttp
+
+            sockets = glob.glob("/tmp/go2rtc-*/go2rtc.sock")
+            if not sockets:
+                return True
+
+            username = password = None
+            for cfg_path in glob.glob("/tmp/go2rtc-*/go2rtc_*.yaml"):
+                try:
+                    with open(cfg_path) as f:
+                        text = f.read()
+                    m = re.search(r"^\s*username:\s+(\S+)", text, re.MULTILINE)
+                    if m:
+                        username = m.group(1)
+                    m = re.search(r"^\s*password:\s+(\S+)", text, re.MULTILINE)
+                    if m:
+                        password = m.group(1)
+                    if username:
+                        break
+                except Exception:
+                    pass
+
+            auth = aiohttp.BasicAuth(username, password) if username else None
+            connector = aiohttp.UnixConnector(path=sockets[0])
+            timeout = aiohttp.ClientTimeout(total=2)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get(
+                    f"http://localhost/api/frame.jpeg?src={cam_entity_id}",
+                    auth=auth,
+                    timeout=timeout,
+                ) as resp:
+                    data = await resp.read()
+                    return len(data) > 1000  # a real JPEG frame is always > 1 KB
+        except Exception:
+            return True  # fail-open
 
     def _get_recipients(self, area: str, kind: str) -> list[str]:
         import re
