@@ -19,6 +19,7 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -641,13 +642,43 @@ class TuyaMQTTBridge:
     def _load_go2rtc_credentials(self) -> bool:
         """Discover go2rtc socket path and credentials (blocking — run via executor).
         Returns True if found, caches results in self._go2rtc_sock/user/pass.
+
+        Finds the ACTIVE go2rtc process via /proc cmdline (avoids picking one of the
+        many stale /tmp/go2rtc-* dirs left behind by previous HA restarts).
         """
         import glob, re
-        sockets = glob.glob("/tmp/go2rtc-*/go2rtc.sock")
-        if not sockets:
+        sock_dir: str | None = None
+
+        # Primary: find running go2rtc process and read its config dir from cmdline.
+        # go2rtc is invoked as: /bin/go2rtc -c /tmp/go2rtc-<id>/go2rtc_<id>.yaml
+        try:
+            for cmdline_path in glob.glob("/proc/*/cmdline"):
+                try:
+                    cmd = open(cmdline_path, "rb").read().decode(errors="ignore")
+                    m = re.search(r"(/tmp/go2rtc-[^/\x00]+)/go2rtc_", cmd)
+                    if m:
+                        sock_dir = m.group(1)
+                        break
+                except OSError:
+                    pass
+        except Exception:
+            pass
+
+        # Fallback: use most-recently modified socket (better than alphabetical).
+        if not sock_dir:
+            sockets = glob.glob("/tmp/go2rtc-*/go2rtc.sock")
+            if not sockets:
+                return False
+            sockets.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            sock_dir = sockets[0].rsplit("/go2rtc.sock", 1)[0]
+
+        candidate = f"{sock_dir}/go2rtc.sock"
+        if not os.path.exists(candidate):
             return False
-        self._go2rtc_sock = sockets[0]
-        for cfg_path in glob.glob("/tmp/go2rtc-*/go2rtc_*.yaml"):
+        self._go2rtc_sock = candidate
+
+        cfg_path = next(iter(glob.glob(f"{sock_dir}/go2rtc_*.yaml")), None)
+        if cfg_path:
             try:
                 with open(cfg_path) as f:
                     text = f.read()
@@ -657,8 +688,6 @@ class TuyaMQTTBridge:
                 m = re.search(r"^\s*password:\s+(\S+)", text, re.MULTILINE)
                 if m:
                     self._go2rtc_pass = m.group(1)
-                if self._go2rtc_user:
-                    break
             except Exception:
                 pass
         return True
@@ -682,14 +711,20 @@ class TuyaMQTTBridge:
             auth = aiohttp.BasicAuth(self._go2rtc_user, self._go2rtc_pass) if self._go2rtc_user else None
             connector = aiohttp.UnixConnector(path=self._go2rtc_sock)
             timeout   = aiohttp.ClientTimeout(total=2)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.get(
-                    f"http://localhost/api/frame.jpeg?src={cam_entity_id}",
-                    auth=auth,
-                    timeout=timeout,
-                ) as resp:
-                    data = await resp.read()
-                    return len(data) > 1000  # a real JPEG frame is always > 1 KB
+            try:
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    async with session.get(
+                        f"http://localhost/api/frame.jpeg?src={cam_entity_id}",
+                        auth=auth,
+                        timeout=timeout,
+                    ) as resp:
+                        data = await resp.read()
+                        return len(data) > 1000  # a real JPEG frame is always > 1 KB
+            except Exception:
+                # Socket connection failed — cached path is stale (HA restarted).
+                # Clear so next call re-discovers the new go2rtc socket.
+                self._go2rtc_sock = None
+                return True  # fail-open
         except Exception:
             return True  # fail-open
 
