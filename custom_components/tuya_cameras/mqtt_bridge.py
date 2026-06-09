@@ -361,17 +361,11 @@ class TuyaMQTTBridge:
                 file_path = parts[0] if len(parts) > 0 else ""
                 file_key  = parts[1] if len(parts) > 1 else ""
                 if "?param=" in file_path and not file_key:
-                    # Signed CDN URL — try fetching directly before giving up.
-                    # If the server returns a plain JPEG (HTTP 200), no decryption needed.
-                    # IP-restriction confirmed for Brazil CDN; EU/CH cameras untested.
-                    _LOGGER.debug("Motion %s/%s: signed CDN URL — attempting direct fetch", area, name)
-                    img_bytes = await self._hass.async_add_executor_job(
-                        self._camera_api.try_oss_image, ev["bucket"], file_path, ""
-                    )
-                    if img_bytes:
-                        _LOGGER.debug("Motion %s/%s: signed CDN fetch ok (age %.0fs)", area, name, age_s)
-                    else:
-                        _LOGGER.debug("Motion %s/%s: signed CDN returned nothing — falling back to snapshot", area, name)
+                    # Signed CDN URL — confirmed blocked (403) for all cameras tested:
+                    # Brasil CDN (IP-restricted to Brazil) and EU Camera Door both return 403.
+                    # Spending ~1.5s on two failing HTTP calls only delays the RTSP snapshot.
+                    # Skip CDN and go straight to snapshot.
+                    _LOGGER.debug("Motion %s/%s: signed CDN URL — skipping (known 403), going direct to snapshot", area, name)
                 else:
                     _LOGGER.debug(
                         "Motion %s/%s: OSS attempt — bucket=%r path=%r key_len=%d",
