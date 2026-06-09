@@ -72,9 +72,6 @@ class TuyaMQTTBridge:
         self._uuids: dict[str, str] = {}         # device_id → uuid
         self._last_msg_at: float = time.monotonic()
         self._last_tech_alert_at: float = 0.0
-        self._go2rtc_sock: str | None = None       # cached on first use
-        self._go2rtc_user: str | None = None
-        self._go2rtc_pass: str | None = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -455,31 +452,6 @@ class TuyaMQTTBridge:
                             img_bytes, prefetched_ai = heal_result
                             snap_note = "recovered snapshot after autonomous RTSP stream heal"
                             break   # exit snapshot loop → fall through to AI filtering + email
-                    elif len(snap_hashes) >= 2:
-                        # Second stale-detection path: frames have different MD5 (timestamp overlay
-                        # or minor encoding difference) but go2rtc stream is dead — it serves cached
-                        # frames from its buffer which look slightly different each time.
-                        # Only trigger if go2rtc confirms the stream is not delivering live frames.
-                        stream_alive = await self._check_go2rtc_stream_alive(cam_entity_id)
-                        if not stream_alive:
-                            _LOGGER.warning(
-                                "Motion %s/%s: conf=0.00 on all snapshots + go2rtc stream dead "
-                                "— RTSP token likely expired, attempting autonomous heal",
-                                area, name,
-                            )
-                            await self._send_tech_alert(
-                                f"Dead RTSP stream — {area}/{name}",
-                                f"Motion at <b>{name}</b> ({area}) at {ev_ts}.<br><br>"
-                                f"All 3 snapshots returned conf=0.00 and go2rtc confirmed the "
-                                f"stream is not delivering live frames (RTSP token expired). "
-                                f"Attempting autonomous heal "
-                                f"(update_entity → 15 s reconnect → retry snapshot + AI).",
-                            )
-                            heal_result = await self._try_rtsp_heal(cam_entity_id, dev_id, snap, area, name)
-                            if heal_result:
-                                img_bytes, prefetched_ai = heal_result
-                                snap_note = "recovered snapshot after autonomous RTSP stream heal (dead stream)"
-                                break
                     _LOGGER.debug(
                         "Motion %s/%s: no human at +%ds (conf=%.2f) — all attempts exhausted",
                         area, name, delay, result["confidence"],
@@ -646,95 +618,6 @@ class TuyaMQTTBridge:
         except Exception as err:
             _LOGGER.debug("Motion %s/%s: RTSP heal attempt failed: %s", area, name, err)
             return None
-
-    def _load_go2rtc_credentials(self) -> bool:
-        """Discover go2rtc socket path and credentials (blocking — run via executor).
-        Returns True if found, caches results in self._go2rtc_sock/user/pass.
-
-        Finds the ACTIVE go2rtc process via /proc cmdline (avoids picking one of the
-        many stale /tmp/go2rtc-* dirs left behind by previous HA restarts).
-        """
-        import glob, re
-        sock_dir: str | None = None
-
-        # Primary: find running go2rtc process and read its config dir from cmdline.
-        # go2rtc is invoked as: /bin/go2rtc -c /tmp/go2rtc-<id>/go2rtc_<id>.yaml
-        try:
-            for cmdline_path in glob.glob("/proc/*/cmdline"):
-                try:
-                    cmd = open(cmdline_path, "rb").read().decode(errors="ignore")
-                    m = re.search(r"(/tmp/go2rtc-[^/\x00]+)/go2rtc_", cmd)
-                    if m:
-                        sock_dir = m.group(1)
-                        break
-                except OSError:
-                    pass
-        except Exception:
-            pass
-
-        # Fallback: use most-recently modified socket (better than alphabetical).
-        if not sock_dir:
-            sockets = glob.glob("/tmp/go2rtc-*/go2rtc.sock")
-            if not sockets:
-                return False
-            sockets.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            sock_dir = sockets[0].rsplit("/go2rtc.sock", 1)[0]
-
-        candidate = f"{sock_dir}/go2rtc.sock"
-        if not os.path.exists(candidate):
-            return False
-        self._go2rtc_sock = candidate
-
-        cfg_path = next(iter(glob.glob(f"{sock_dir}/go2rtc_*.yaml")), None)
-        if cfg_path:
-            try:
-                with open(cfg_path) as f:
-                    text = f.read()
-                m = re.search(r"^\s*username:\s+(\S+)", text, re.MULTILINE)
-                if m:
-                    self._go2rtc_user = m.group(1)
-                m = re.search(r"^\s*password:\s+(\S+)", text, re.MULTILINE)
-                if m:
-                    self._go2rtc_pass = m.group(1)
-            except Exception:
-                pass
-        return True
-
-    async def _check_go2rtc_stream_alive(self, cam_entity_id: str | None) -> bool:
-        """Return True if go2rtc is serving live frames for the camera, False if dead.
-
-        Uses go2rtc's Unix-socket API (/api/frame.jpeg) with a 2-second timeout.
-        Credentials are discovered once and cached. Fails open on any error.
-        """
-        if not cam_entity_id:
-            return True
-        try:
-            import aiohttp
-            # Load credentials via executor on first call (avoids blocking event loop)
-            if self._go2rtc_sock is None:
-                found = await self._hass.async_add_executor_job(self._load_go2rtc_credentials)
-                if not found or not self._go2rtc_sock:
-                    return True  # go2rtc socket not found — assume alive
-
-            auth = aiohttp.BasicAuth(self._go2rtc_user, self._go2rtc_pass) if self._go2rtc_user else None
-            connector = aiohttp.UnixConnector(path=self._go2rtc_sock)
-            timeout   = aiohttp.ClientTimeout(total=2)
-            try:
-                async with aiohttp.ClientSession(connector=connector) as session:
-                    async with session.get(
-                        f"http://localhost/api/frame.jpeg?src={cam_entity_id}",
-                        auth=auth,
-                        timeout=timeout,
-                    ) as resp:
-                        data = await resp.read()
-                        return len(data) > 1000  # a real JPEG frame is always > 1 KB
-            except Exception:
-                # Socket connection failed — cached path is stale (HA restarted).
-                # Clear so next call re-discovers the new go2rtc socket.
-                self._go2rtc_sock = None
-                return True  # fail-open
-        except Exception:
-            return True  # fail-open
 
     def _get_recipients(self, area: str, kind: str) -> list[str]:
         import re
