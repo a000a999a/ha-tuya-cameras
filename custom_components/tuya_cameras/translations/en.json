@@ -37,7 +37,8 @@
           "edit_smtp":       "Update SMTP / email settings",
           "edit_recipients": "Edit area recipients",
           "edit_settings":   "Refresh interval & SD alert threshold",
-          "edit_ai":         "AI human detection"
+          "edit_ai":         "AI human detection",
+          "edit_alerts":     "Motion alert sources"
         }
       },
       "edit_settings": {
@@ -67,6 +68,14 @@
         "data": {
           "human": "Human alert recipients",
           "tech":  "Tech alert recipients"
+        }
+      },
+      "edit_alerts": {
+        "title": "Configure MQTT vs Android App Webhook",
+        "description": "MQTT: low-latency push from Tuya cloud — always active for all cameras.\nSmartLife webhook: direct capture image from the SmartLife app on your tablet — better image timing for Brasil cameras.\n\nWebhook URL for the Android bridge app:\n{webhook_url}",
+        "data": {
+          "mqtt_alerts_enabled":    "Enable MQTT motion alerts",
+          "webhook_alerts_enabled": "Enable SmartLife webhook alerts (requires Android bridge app)"
         }
       },
       "edit_ai": {

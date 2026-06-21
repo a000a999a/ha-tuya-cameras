@@ -47,3 +47,8 @@ CONF_AI_ENABLED = "ai_detection_enabled"
 CONF_AI_URL     = "ai_detection_url"
 DEFAULT_AI_URL  = "http://localhost:8000"
 EVENT_AI_UPDATED = f"{DOMAIN}_ai_updated"
+
+# Motion alert source toggles
+CONF_MQTT_ALERTS_ENABLED    = "mqtt_alerts_enabled"
+CONF_WEBHOOK_ALERTS_ENABLED = "webhook_alerts_enabled"
+WEBHOOK_ID                  = "smartlife_motion"

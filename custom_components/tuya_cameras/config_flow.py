@@ -11,6 +11,9 @@ from .ai_client import AIClient
 from .const import (
     CONF_AI_ENABLED,
     CONF_AI_URL,
+    CONF_MQTT_ALERTS_ENABLED,
+    CONF_WEBHOOK_ALERTS_ENABLED,
+    WEBHOOK_ID,
     CONF_CORE_ENTRY_ID,
     CONF_HUMAN_RECIPIENTS,
     CONF_RECIPIENTS,
@@ -176,7 +179,7 @@ class TuyaCamerasOptionsFlow(OptionsFlow):
     async def async_step_init(self, user_input: dict | None = None) -> ConfigFlowResult:
         return self.async_show_menu(
             step_id="init",
-            menu_options=["edit_smtp", "edit_recipients", "edit_settings", "edit_ai"],
+            menu_options=["edit_smtp", "edit_recipients", "edit_settings", "edit_ai", "edit_alerts"],
         )
 
     async def async_step_edit_settings(self, user_input: dict | None = None) -> ConfigFlowResult:
@@ -260,6 +263,38 @@ class TuyaCamerasOptionsFlow(OptionsFlow):
             step_id="edit_area",
             data_schema=_area_schema(area, self._recipients.get(area, {})),
             description_placeholders={"area": area},
+        )
+
+    async def async_step_edit_alerts(self, user_input: dict | None = None) -> ConfigFlowResult:
+        if user_input is not None:
+            new_options = {
+                **self._entry.options,
+                CONF_RECIPIENTS:             self._recipients,
+                CONF_MQTT_ALERTS_ENABLED:    user_input.get(CONF_MQTT_ALERTS_ENABLED, True),
+                CONF_WEBHOOK_ALERTS_ENABLED: user_input.get(CONF_WEBHOOK_ALERTS_ENABLED, False),
+            }
+            return self.async_create_entry(data=new_options)
+
+        mqtt_on    = self._entry.options.get(CONF_MQTT_ALERTS_ENABLED, True)
+        webhook_on = self._entry.options.get(CONF_WEBHOOK_ALERTS_ENABLED, False)
+
+        try:
+            from homeassistant.helpers.network import get_url
+            base = get_url(self.hass, prefer_internal=True)
+        except Exception:
+            base = "http://homeassistant.local:8123"
+        webhook_url = f"{base.rstrip('/')}/api/webhook/{WEBHOOK_ID}"
+
+        schema = vol.Schema({
+            vol.Optional(CONF_MQTT_ALERTS_ENABLED, default=mqtt_on):
+                selector.BooleanSelector(),
+            vol.Optional(CONF_WEBHOOK_ALERTS_ENABLED, default=webhook_on):
+                selector.BooleanSelector(),
+        })
+        return self.async_show_form(
+            step_id="edit_alerts",
+            data_schema=schema,
+            description_placeholders={"webhook_url": webhook_url},
         )
 
     async def async_step_edit_ai(self, user_input: dict | None = None) -> ConfigFlowResult:

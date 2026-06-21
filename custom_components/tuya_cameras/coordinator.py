@@ -7,6 +7,7 @@ from datetime import timedelta
 from typing import Any
 
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import area_registry as ar, device_registry as dr, entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .camera_api import CameraAPI
@@ -19,7 +20,8 @@ class CameraCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """
     Refreshes camera list and SD status on a user-configurable interval (default 14 days).
     Camera list sourced from tuya_home_core coordinator (no extra API call).
-    SD status polled per camera from Tuya Cloud.
+    Falls back to HA entity registry when Tuya device API is unavailable.
+    SD status polled per camera from Tuya Cloud (skipped when API unavailable).
     Manual refresh available via the central Refresh button entity.
 
     data layout:
@@ -58,16 +60,25 @@ class CameraCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._camera_api.cameras_from_devices, devices, area_map
         )
 
+        if not cameras:
+            cameras = self._cameras_from_registry()
+            if cameras:
+                _LOGGER.info(
+                    "Tuya device API unavailable — %d cameras loaded from HA entity registry",
+                    len(cameras),
+                )
+
         cam_map: dict[str, dict] = {}
         for cam in cameras:
             dev_id = cam["id"]
-            try:
-                sd = await self.hass.async_add_executor_job(
-                    self._camera_api.get_sd_status, dev_id
-                )
-            except Exception as err:
-                _LOGGER.warning("SD poll failed for %s: %s", dev_id, err)
-                sd = {}
+            sd: dict = {}
+            if devices:
+                try:
+                    sd = await self.hass.async_add_executor_job(
+                        self._camera_api.get_sd_status, dev_id
+                    )
+                except Exception as err:
+                    _LOGGER.warning("SD poll failed for %s: %s", dev_id, err)
             cam_map[dev_id] = {**cam, **sd}
 
         if not cam_map and self.data:
@@ -76,3 +87,38 @@ class CameraCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         _LOGGER.debug("Camera coordinator refreshed: %d cameras", len(cam_map))
         return {"cameras": cam_map}
+
+    def _cameras_from_registry(self) -> list[dict]:
+        """Build camera list from HA entity/device/area registry when Tuya API is unavailable.
+
+        The official HA Tuya hub registers cameras with unique_id "tuya.{device_id}".
+        Device names and area assignments come from the device + area registries.
+        """
+        entity_reg = er.async_get(self.hass)
+        device_reg = dr.async_get(self.hass)
+        area_reg   = ar.async_get(self.hass)
+
+        cameras = []
+        for entity in entity_reg.entities.values():
+            if not entity.entity_id.startswith("camera.") or entity.platform != "tuya":
+                continue
+            uid    = entity.unique_id or ""
+            dev_id = uid.removeprefix("tuya.")
+            if not dev_id or len(dev_id) < 10:
+                continue
+
+            name      = entity.name or entity.original_name or dev_id
+            area_name = ""
+
+            if entity.device_id:
+                device = device_reg.async_get(entity.device_id)
+                if device:
+                    name = device.name_by_user or device.name or name
+                    if device.area_id:
+                        area = area_reg.async_get_area(device.area_id)
+                        if area:
+                            area_name = area.name
+
+            cameras.append({"id": dev_id, "name": name, "area": area_name, "online": True})
+
+        return cameras

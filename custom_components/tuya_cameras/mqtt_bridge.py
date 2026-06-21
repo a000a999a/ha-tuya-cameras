@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import os
+import socket
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -52,8 +53,10 @@ class TuyaMQTTBridge:
         uid: str,
         access_id: str,
         core_coord: Any = None,
+        cam_coord: Any = None,
         ai_client: AIClient | None = None,
         ai_stats: AIStats | None = None,
+        alerts_enabled: bool = True,
     ) -> None:
         self._hass           = hass
         self._tuya_client    = tuya_client
@@ -63,8 +66,10 @@ class TuyaMQTTBridge:
         self._uid            = uid
         self._access_id      = access_id
         self._core_coord     = core_coord      # coordinator for this project's device list only
+        self._cam_coord      = cam_coord       # cameras coordinator (has entity registry fallback)
         self._ai_client      = ai_client   # None = AI disabled
         self._ai_stats       = ai_stats
+        self._alerts_enabled = alerts_enabled
         self._task: asyncio.Task | None = None
         self._watchdog_task: asyncio.Task | None = None
         self._local_keys: dict[str, str] = {}    # device_id → local_key
@@ -260,7 +265,23 @@ class TuyaMQTTBridge:
             client.username_pw_set(creds["username"], creds["password"])
             client.tls_set()
             client.on_connect = on_connect
-            client.connect(host, port, keepalive=60)
+
+            # m1.tuyaeu.com resolves IPv6-first; on a dual-stack host paho
+            # connects via IPv6, TLS succeeds, but Tuya's broker delivers no
+            # events on IPv6 sessions — silent MQTT with healthy keepalive.
+            # Patch getaddrinfo for the duration of connect() so paho picks
+            # an IPv4 address, while still passing the hostname to TLS for
+            # correct SNI / certificate verification.
+            _orig_gai = socket.getaddrinfo
+            def _ipv4_gai(h, p, family=0, *a, **kw):
+                if h == host:
+                    return _orig_gai(h, p, socket.AF_INET, *a, **kw)
+                return _orig_gai(h, p, family, *a, **kw)
+            socket.getaddrinfo = _ipv4_gai
+            try:
+                client.connect(host, port, keepalive=60)
+            finally:
+                socket.getaddrinfo = _orig_gai
             client.loop_start()
 
             deadline = time.time() + 15
@@ -300,9 +321,12 @@ class TuyaMQTTBridge:
         if not dev_id or not isinstance(status, list):
             return
 
-        # Build camera list before the code filter so we can log unknown codes from known cameras
+        # Build camera list before the code filter so we can log unknown codes from known cameras.
+        # Prefer cameras coordinator — has entity registry fallback when Tuya device API is down.
         cameras: dict = {}
-        if self._core_coord and self._core_coord.data:
+        if self._cam_coord and self._cam_coord.data:
+            cameras = self._cam_coord.data.get("cameras", {})
+        elif self._core_coord and self._core_coord.data:
             cam_list = self._camera_api.cameras_from_devices(
                 self._core_coord.data.get("devices", []),
                 self._core_coord.data.get("areas", {}),
@@ -517,10 +541,13 @@ class TuyaMQTTBridge:
 
         to_addrs = self._get_recipients(area, "human")
         if to_addrs:
-            await self._hass.async_add_executor_job(
-                self._notifier.send, subject, body, to_addrs, email_image
-            )
-            _LOGGER.info("Motion alert sent for %s/%s to %s", area, name, to_addrs)
+            if not self._alerts_enabled:
+                _LOGGER.debug("Motion %s/%s: MQTT alerts disabled — email suppressed", area, name)
+            else:
+                await self._hass.async_add_executor_job(
+                    self._notifier.send, subject, body, to_addrs, email_image
+                )
+                _LOGGER.info("Motion alert sent for %s/%s to %s", area, name, to_addrs)
 
     async def _find_camera_entity_id(self, dev_id: str) -> str | None:
         """Look up the HA camera entity ID for a Tuya device ID."""

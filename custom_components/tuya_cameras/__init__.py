@@ -16,12 +16,14 @@ from .camera_api import CameraAPI
 from .const import (
     CONF_AI_ENABLED, CONF_AI_URL,
     CONF_CORE_ENTRY_ID, CONF_RECIPIENTS, CONF_REFRESH_DAYS, DEFAULT_REFRESH_DAYS,
+    CONF_MQTT_ALERTS_ENABLED, CONF_WEBHOOK_ALERTS_ENABLED,
     CONF_SMTP_HOST, CONF_SMTP_PASSWORD, CONF_SMTP_PORT, CONF_SMTP_SENDER,
     DOMAIN, DOMAIN_CORE,
 )
 from .coordinator import CameraCoordinator
 from .mqtt_bridge import TuyaMQTTBridge
 from .notify import Notifier
+from .webhook_bridge import SmartLifeWebhookBridge
 
 _LOGGER = logging.getLogger(__name__)
 PLATFORMS = ["sensor", "button"]
@@ -449,6 +451,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if ai_client:
         _LOGGER.info("AI detection enabled, service: %s", ai_url)
 
+    mqtt_enabled    = entry.options.get(CONF_MQTT_ALERTS_ENABLED, True)
+    webhook_enabled = entry.options.get(CONF_WEBHOOK_ALERTS_ENABLED, False)
+
     bridge = TuyaMQTTBridge(
         hass           = hass,
         tuya_client    = tuya_client,
@@ -458,18 +463,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         uid            = uid,
         access_id      = access_id,
         core_coord     = core_coord,
+        cam_coord      = coordinator,
         ai_client      = ai_client,
         ai_stats       = ai_stats,
+        alerts_enabled = mqtt_enabled,
     )
 
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
-        "coordinator":  coordinator,
-        "core_coord":   core_coord,
-        "camera_api":   camera_api,
-        "notifier":     notifier,
-        "bridge":       bridge,
-        "ai_stats":     ai_stats,
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    domain_data[entry.entry_id] = {
+        "coordinator":           coordinator,
+        "core_coord":            core_coord,
+        "camera_api":            camera_api,
+        "notifier":              notifier,
+        "bridge":                bridge,
+        "ai_stats":              ai_stats,
+        "webhook_alerts_enabled": webhook_enabled,
     }
+
+    # Start global webhook bridge if any entry has it enabled and it isn't running yet
+    if webhook_enabled and "_webhook" not in domain_data:
+        wb = SmartLifeWebhookBridge(hass)
+        wb.start()
+        domain_data["_webhook"] = wb
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
@@ -512,6 +527,18 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
         hass.data[DOMAIN].pop(entry.entry_id, None)
+
+        # Stop webhook bridge if no remaining entry has it enabled
+        any_webhook = any(
+            v.get("webhook_alerts_enabled", False)
+            for v in hass.data[DOMAIN].values()
+            if isinstance(v, dict) and "bridge" in v
+        )
+        if not any_webhook:
+            wb: SmartLifeWebhookBridge | None = hass.data[DOMAIN].pop("_webhook", None)
+            if wb:
+                wb.stop()
+
     return unloaded
 
 
