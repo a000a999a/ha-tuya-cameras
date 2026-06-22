@@ -16,3 +16,4 @@ secrets.yaml
 .venv/
 dist/
 *.egg-info/
+android/*.apk
