@@ -33,11 +33,12 @@ from .notify import Notifier
 
 _LOGGER = logging.getLogger(__name__)
 
-RECONNECT_BUFFER_S   = 600   # refresh creds 10 min before expiry
-RETRY_DELAY_S        = 30
-WATCHDOG_SILENCE_S   = 3600  # tech alert after 1 h with no MQTT messages
-WATCHDOG_CHECK_S     = 300   # check every 5 min
-TECH_ALERT_COOLDOWN  = 1800  # suppress duplicate tech alerts for 30 min
+RECONNECT_BUFFER_S        = 600    # refresh creds 10 min before expiry
+RETRY_DELAY_S             = 30
+WATCHDOG_SILENCE_S        = 3600   # alert if client is DISCONNECTED + silent for 1 h
+WATCHDOG_SILENCE_CONN_S   = 28800  # alert if client is CONNECTED but silent for 8 h (cameras quiet)
+WATCHDOG_CHECK_S          = 300    # check every 5 min
+TECH_ALERT_COOLDOWN       = 1800   # suppress duplicate tech alerts for 30 min
 
 
 class TuyaMQTTBridge:
@@ -77,6 +78,7 @@ class TuyaMQTTBridge:
         self._uuids: dict[str, str] = {}         # device_id → uuid
         self._last_msg_at: float = time.monotonic()
         self._last_tech_alert_at: float = 0.0
+        self._current_client: Any = None  # live paho client; None when disconnected
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -137,6 +139,7 @@ class TuyaMQTTBridge:
 
                 client.on_message    = on_message
                 client.on_disconnect = on_disconnect
+                self._current_client = client  # watchdog reads this to distinguish quiet vs broken
 
                 _LOGGER.info("MQTT bridge connected. Creds expire in %ds", expire_s)
 
@@ -145,12 +148,14 @@ class TuyaMQTTBridge:
                 try:
                     await asyncio.wait_for(disconnect_event.wait(), timeout=cred_timeout)
                     # Disconnected — wait briefly then reconnect with same creds
+                    self._current_client = None
                     await self._hass.async_add_executor_job(self._disconnect, client)
                     await asyncio.sleep(reconnect_delay)
                     continue
                 except asyncio.TimeoutError:
                     pass  # Credentials about to expire — fall through to refresh
 
+                self._current_client = None
                 await self._hass.async_add_executor_job(self._disconnect, client)
                 _LOGGER.info("Refreshing MQTT credentials")
 
@@ -680,16 +685,30 @@ class TuyaMQTTBridge:
         _LOGGER.info("Tech alert sent: %s → %s", subject, to)
 
     async def _watchdog(self) -> None:
-        """Send a tech alert if no MQTT messages received for WATCHDOG_SILENCE_S seconds."""
+        """Send a tech alert if MQTT goes silent beyond the expected threshold.
+
+        Two thresholds:
+        - Disconnected (client is None or not connected): alert after 1 h silence.
+          A healthy bridge reconnects within seconds; 1 h means reconnection is stuck.
+        - Connected but silent: alert after 8 h silence.
+          Cameras in quiet locations (Wallis farm, overnight) can go hours without
+          a motion event — that is normal and should not produce alerts.
+        """
         while True:
             try:
                 await asyncio.sleep(WATCHDOG_CHECK_S)
                 silence = time.monotonic() - self._last_msg_at
-                if silence > WATCHDOG_SILENCE_S:
+                connected = bool(
+                    self._current_client and self._current_client.is_connected()
+                )
+                threshold = WATCHDOG_SILENCE_CONN_S if connected else WATCHDOG_SILENCE_S
+                if silence > threshold:
+                    state = "connected but silent" if connected else "disconnected"
                     await self._send_tech_alert(
                         "MQTT bridge silent",
-                        f"No MQTT messages received for {silence / 60:.0f} minutes. "
-                        f"The bridge may be disconnected or Tuya broker may have stopped pushing events.",
+                        f"No MQTT messages received for {silence / 60:.0f} minutes "
+                        f"(bridge is {state}). "
+                        f"The bridge may be broken or Tuya broker may have stopped pushing events.",
                     )
             except asyncio.CancelledError:
                 return

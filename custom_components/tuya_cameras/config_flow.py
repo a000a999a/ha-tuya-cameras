@@ -225,12 +225,10 @@ class TuyaCamerasOptionsFlow(OptionsFlow):
 
     async def async_step_edit_recipients(self, user_input: dict | None = None) -> ConfigFlowResult:
         areas = list(self._recipients.keys())
-        core = self.hass.data.get(DOMAIN_CORE, {}).get(
-            self._entry.data.get(CONF_CORE_ENTRY_ID), {}
-        )
-        coord = core.get("coordinator")
+        cam_data = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+        coord = cam_data.get("coordinator")
         if coord and coord.data:
-            live_areas = sorted({a for a in coord.data.get("areas", {}).values() if a})
+            live_areas = sorted({cam["area"] for cam in coord.data.get("cameras", {}).values() if cam.get("area")})
             for a in live_areas:
                 if a not in self._recipients:
                     self._recipients[a] = {CONF_HUMAN_RECIPIENTS: "", CONF_TECH_RECIPIENTS: ""}
