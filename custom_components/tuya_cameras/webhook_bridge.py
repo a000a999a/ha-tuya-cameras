@@ -104,7 +104,7 @@ class SmartLifeWebhookBridge:
                 )
                 return
             entity_id = await bridge._find_camera_entity_id(dev_id) if dev_id else None
-            for attempt, delay in enumerate([0, 2, 4]):
+            for attempt, delay in enumerate([0, 1, 3]):
                 if delay:
                     await asyncio.sleep(delay)
                 snap = await bridge._get_ha_snapshot(dev_id, entity_id) if dev_id else None

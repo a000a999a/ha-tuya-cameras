@@ -412,7 +412,7 @@ class TuyaMQTTBridge:
             _LOGGER.debug("Motion %s/%s: no OSS image — trying HA snapshot(s)", area, name)
             cam_entity_id = await self._find_camera_entity_id(dev_id)
             snap_hashes: list[str] = []
-            for attempt, delay in enumerate((0, 2, 4)):
+            for attempt, delay in enumerate((0, 1, 3)):
                 if delay:
                     await asyncio.sleep(delay)
                 snap = await self._get_ha_snapshot(dev_id, cam_entity_id)
@@ -452,7 +452,7 @@ class TuyaMQTTBridge:
                         area, name, delay, result["confidence"],
                     )
                     break
-                if delay == 4:
+                if delay == 3:
                     # All attempts exhausted — check for stale RTSP frame before discarding.
                     # Applies universally: Brasil v4.0, Brasil ?param=, Wallis, Camera Door —
                     # any camera that ends up in the snapshot path can hit this.
