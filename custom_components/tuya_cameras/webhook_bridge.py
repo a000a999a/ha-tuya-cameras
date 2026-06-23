@@ -183,7 +183,7 @@ class SmartLifeWebhookBridge:
             return
 
         ev_ts   = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        subject = f"Motion detected — {area} / {cam_name}"
+        subject = f"Motion detected — {area} / {cam_name} [SmartLife]"
         body    = (
             f"<html><body>"
             f"<h2 style='color:#c0392b;'>Motion Detected</h2>"

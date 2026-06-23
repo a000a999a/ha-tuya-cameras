@@ -58,6 +58,7 @@ class TuyaMQTTBridge:
         ai_client: AIClient | None = None,
         ai_stats: AIStats | None = None,
         alerts_enabled: bool = True,
+        entry_label: str = "",
     ) -> None:
         self._hass           = hass
         self._tuya_client    = tuya_client
@@ -71,6 +72,7 @@ class TuyaMQTTBridge:
         self._ai_client      = ai_client   # None = AI disabled
         self._ai_stats       = ai_stats
         self._alerts_enabled = alerts_enabled
+        self._entry_label    = entry_label or uid  # used in tech alerts + motion email source tag
         self._task: asyncio.Task | None = None
         self._watchdog_task: asyncio.Task | None = None
         self._local_keys: dict[str, str] = {}    # device_id → local_key
@@ -79,6 +81,7 @@ class TuyaMQTTBridge:
         self._last_msg_at: float = time.monotonic()
         self._last_tech_alert_at: float = 0.0
         self._current_client: Any = None  # live paho client; None when disconnected
+        self._last_healed_at: float = 0.0  # last time watchdog forced a reconnect to heal silence
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -531,13 +534,14 @@ class TuyaMQTTBridge:
             f'<tr><td><b>Note</b></td><td style="color:#e67e22;">{snap_note}</td></tr>'
             if snap_note else ""
         )
-        subject = f"Motion detected — {area} / {name}"
+        subject = f"Motion detected — {area} / {name} [MQTT]"
         body    = f"""<html><body>
 <h2 style="color:#c0392b;">Motion Detected</h2>
 <table>
   <tr><td><b>Camera</b></td><td>{name}</td></tr>
   <tr><td><b>Area</b></td><td>{area}</td></tr>
   <tr><td><b>Time</b></td><td>{ev_ts}</td></tr>
+  <tr><td><b>Source</b></td><td style="color:#2980b9;">MQTT (Tuya broker · {self._entry_label})</td></tr>
   {snap_row}
 </table>
 {'<br><img src="cid:motion_image" style="max-width:640px; border:1px solid #ccc;">' if email_image else ''}
@@ -684,6 +688,23 @@ class TuyaMQTTBridge:
         )
         _LOGGER.info("Tech alert sent: %s → %s", subject, to)
 
+    def _get_camera_states(self) -> dict[str, str]:
+        """Return {camera_name: ha_state} for all cameras known to this bridge's coordinator."""
+        result: dict[str, str] = {}
+        try:
+            cam_data = (self._cam_coord.data or {}).get("cameras", {}) if self._cam_coord else {}
+            for dev_id, cam in cam_data.items():
+                name = cam.get("name", dev_id)
+                entity_id = cam.get("entity_id")
+                if not entity_id:
+                    # Derive from device_id: official Tuya hub uses tuya. prefix stripped as entity
+                    entity_id = f"camera.{dev_id.lower().replace('-', '_')}"
+                state = self._hass.states.get(entity_id)
+                result[name] = state.state if state else "unknown"
+        except Exception:
+            pass
+        return result
+
     async def _watchdog(self) -> None:
         """Send a tech alert if MQTT goes silent beyond the expected threshold.
 
@@ -703,13 +724,58 @@ class TuyaMQTTBridge:
                 )
                 threshold = WATCHDOG_SILENCE_CONN_S if connected else WATCHDOG_SILENCE_S
                 if silence > threshold:
-                    state = "connected but silent" if connected else "disconnected"
-                    await self._send_tech_alert(
-                        "MQTT bridge silent",
-                        f"No MQTT messages received for {silence / 60:.0f} minutes "
-                        f"(bridge is {state}). "
-                        f"The bridge may be broken or Tuya broker may have stopped pushing events.",
+                    # Check whether cameras in this bridge are offline (intentionally disabled).
+                    # If all known cameras are unavailable, silence is explained — skip heal.
+                    cam_states = self._get_camera_states()
+                    all_offline = bool(cam_states) and all(
+                        s in ("unavailable", "idle", "off") for s in cam_states.values()
                     )
+                    if all_offline:
+                        _LOGGER.debug(
+                            "Watchdog %s: silence %.0f min but all cameras offline — suppressing",
+                            self._entry_label, silence / 60,
+                        )
+                        await self._send_tech_alert(
+                            f"MQTT bridge silent — {self._entry_label} — cameras offline",
+                            f"No MQTT messages for {silence / 60:.0f} minutes, but all cameras "
+                            f"for this bridge appear offline or unavailable in HA "
+                            f"({', '.join(f'{k}={v}' for k, v in cam_states.items())}). "
+                            f"Silence is expected. Re-enable cameras to resume motion alerts.",
+                        )
+                    else:
+                        heal_eligible = (
+                            connected
+                            and (time.monotonic() - self._last_healed_at) > threshold
+                        )
+                        if heal_eligible:
+                            # Force a reconnect: disconnecting the live client triggers on_disconnect
+                            # → disconnect_event.set() → _run() reconnects with fresh AF_INET creds.
+                            # Fixes IPv6-stale sessions; harmless if silence is genuine.
+                            client_to_drop = self._current_client
+                            self._current_client = None
+                            self._last_healed_at = time.monotonic()
+                            self._last_msg_at    = time.monotonic()  # reset window from heal time
+                            await self._hass.async_add_executor_job(self._disconnect, client_to_drop)
+                            _LOGGER.info(
+                                "Watchdog heal: forced reconnect for %s after %.0f min silence",
+                                self._entry_label, silence / 60,
+                            )
+                            await self._send_tech_alert(
+                                f"MQTT bridge silent — {self._entry_label} — reconnecting",
+                                f"No MQTT messages for {silence / 60:.0f} minutes (connected but silent). "
+                                f"Forcing reconnect to heal potential stale session (e.g. IPv6 stuck). "
+                                f"If events resume, the session was stale. If still silent after 8 h, "
+                                f"cameras in this area may genuinely have no motion.",
+                            )
+                        else:
+                            state = "connected but silent" if connected else "disconnected"
+                            await self._send_tech_alert(
+                                f"MQTT bridge silent — {self._entry_label}",
+                                f"No MQTT messages received for {silence / 60:.0f} minutes "
+                                f"(bridge is {state}). "
+                                f"A reconnect was already attempted. If no events arrive, this area "
+                                f"may be genuinely quiet or the broker has a persistent issue.",
+                            )
             except asyncio.CancelledError:
                 return
             except Exception as err:

@@ -467,6 +467,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ai_client      = ai_client,
         ai_stats       = ai_stats,
         alerts_enabled = mqtt_enabled,
+        entry_label    = entry.title,
     )
 
     domain_data = hass.data.setdefault(DOMAIN, {})
