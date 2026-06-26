@@ -175,7 +175,7 @@ async def _update_lovelace_views(hass: HomeAssistant) -> None:
                 if _patch_cameras_view(view, cam_info):
                     changed = True
             elif path == "ai-detections":
-                if _patch_ai_detections_view(view, registry):
+                if _patch_ai_detections_view(view, registry, hass):
                     changed = True
 
         if changed:
@@ -308,37 +308,81 @@ def _patch_cameras_view(view: dict, cam_info: dict) -> bool:
     return changed
 
 
-def _patch_ai_detections_view(view: dict, registry) -> bool:
+def _patch_ai_detections_view(view: dict, registry, hass=None) -> bool:
     """
     Rebuild the AI Detections view sections dynamically:
 
-    • Last Human Detection — one tile per sensor.tuya_cameras_last_human_* entity,
-      sorted alphabetically by area name, covering all tuya_cameras entries.
-    • Live Counts — adds tile cards for any tuya_cameras entries not yet represented
-      (e.g. Wallis entry stats appear after the Main Home stats).
-    • 7-Day Summary — same: adds statistic cards for missing entries.
+    • Last Human Detection — one tile per area (deduplicated), using the canonical
+      entry for each area (derived from coordinator data when hass is provided).
+    • Live Counts — rebuilt from all entries with ai stat sensors.
+    • 7-Day Summary — same.
+
+    Sensors are matched by unique_id suffix (_ai_total/_ai_human/_ai_other) so
+    entity_id naming differences (e.g. de_ch_br prefix, _2 suffix) are handled
+    transparently.
     """
     changed = False
     sections = view.get("sections", [])
 
-    # ── Last Human Detection ─────────────────────────────────────────────────
-    last_human: list[tuple[str, str]] = []
-    for entry in registry.entities.values():
-        eid = entry.entity_id
-        if not eid.startswith("sensor.tuya_cameras_last_human_"):
+    # ── Build area→entry_id and entry_id→label from coordinator data ──────────
+    area_canonical: dict[str, str] = {}  # area_slug → entry_id
+    entry_label: dict[str, str] = {}     # entry_id → short display label
+    if hass:
+        for eid, edata in hass.data.get(DOMAIN, {}).items():
+            if not isinstance(edata, dict):
+                continue
+            ce = hass.config_entries.async_get_entry(eid)
+            if ce:
+                entry_label[eid] = ce.title.replace("Tuya Cameras ", "").strip() or ce.title
+            cam_coord = edata.get("coordinator")
+            if cam_coord and cam_coord.data:
+                for cam in cam_coord.data.get("cameras", {}).values():
+                    area = cam.get("area", "")
+                    if area:
+                        slug = area.lower().replace(" ", "_")
+                        if slug not in area_canonical:
+                            area_canonical[slug] = eid
+
+    # ── Find ai stat sensors by unique_id suffix (immune to entity_id naming) ─
+    entry_stat_eid: dict[str, dict[str, str]] = {}
+    for ent in registry.entities.values():
+        uid = ent.unique_id or ""
+        for suffix, stat in [("_ai_total", "total"), ("_ai_human", "human"), ("_ai_other", "other")]:
+            if uid.endswith(suffix):
+                entry_stat_eid.setdefault(uid[: -len(suffix)], {})[stat] = ent.entity_id
+                break
+
+    def _entry_sort(eid: str) -> tuple:
+        return (0 if eid in entry_label else 1, eid)
+    sorted_entry_ids = sorted(entry_stat_eid, key=_entry_sort)
+
+    # ── Last Human Detection — one tile per area, canonical entry wins ─────────
+    area_candidates: dict[str, list[tuple[str, str]]] = {}
+    for ent in registry.entities.values():
+        uid = ent.unique_id or ""
+        if "_ai_last_human_" not in uid:
             continue
-        raw_name = (entry.original_name or "").replace("Last Human — ", "").strip()
-        if not raw_name:
-            raw_name = eid[len("sensor.tuya_cameras_last_human_"):].replace("_", " ").title()
-        last_human.append((raw_name, eid))
+        parts = uid.split("_ai_last_human_", 1)
+        if len(parts) != 2:
+            continue
+        e_id, area_slug = parts
+        area_candidates.setdefault(area_slug, []).append((e_id, ent.entity_id))
+
+    last_human: list[tuple[str, str]] = []
+    for area_slug, candidates in sorted(area_candidates.items()):
+        canonical = area_canonical.get(area_slug)
+        # Skip orphaned areas that no longer exist in any coordinator
+        if hass and area_canonical and area_slug not in area_canonical:
+            continue
+        chosen = next((eid for e_id, eid in candidates if e_id == canonical), candidates[0][1])
+        area_name = area_slug.replace("_", " ").title()
+        last_human.append((area_name, chosen))
     last_human.sort(key=lambda x: x[0])
 
-    new_lh_cards = [{"type": "heading", "heading": "Last Human Detection"}]
+    new_lh_cards: list[dict] = [{"type": "heading", "heading": "Last Human Detection"}]
     for area_name, sensor_eid in last_human:
-        new_lh_cards.append({
-            "type": "tile", "entity": sensor_eid,
-            "name": area_name, "icon": "mdi:account-clock",
-        })
+        new_lh_cards.append({"type": "tile", "entity": sensor_eid,
+                              "name": area_name, "icon": "mdi:account-clock"})
 
     for section in sections:
         cards = section.get("cards", [])
@@ -348,61 +392,48 @@ def _patch_ai_detections_view(view: dict, registry) -> bool:
                 changed = True
             break
 
-    # ── Live Counts — add tiles for missing entries ───────────────────────────
-    all_processed = sorted(
-        e.entity_id for e in registry.entities.values()
-        if e.entity_id.startswith("sensor.tuya_cameras_ai_processed_7d")
-    )
+    # ── Live Counts and 7-Day Summary — rebuild from actual sensor entities ────
+    period = {"calendar": {"period": "week"}}
     for section in sections:
         cards = section.get("cards", [])
-        if not any(c.get("heading") == "Live Counts" for c in cards):
+        heading = next((c["heading"] for c in cards if c.get("type") == "heading"), None)
+        if heading not in ("Live Counts", "7-Day Summary"):
             continue
-        existing = {c.get("entity") for c in cards}
-        for p_eid in all_processed:
-            if p_eid in existing:
+        is_stat = heading == "7-Day Summary"
+        new_cards: list[dict] = [{"type": "heading", "heading": heading}]
+        for e_id in sorted_entry_ids:
+            s = entry_stat_eid[e_id]
+            p_eid = s.get("total")
+            h_eid = s.get("human")
+            d_eid = s.get("other")
+            if not p_eid:
                 continue
-            suffix = p_eid[len("sensor.tuya_cameras_ai_processed_7d"):]
-            h_eid  = f"sensor.tuya_cameras_ai_human_detected_7d{suffix}"
-            d_eid  = f"sensor.tuya_cameras_ai_discarded_7d{suffix}"
-            label  = f" ({suffix.lstrip('_')})" if suffix else ""
-            cards += [
-                {"type": "tile", "entity": p_eid,
-                 "name": f"Processed (7d){label}", "icon": "mdi:image-multiple"},
-                {"type": "tile", "entity": h_eid,
-                 "name": f"Human Detected (7d){label}", "icon": "mdi:account-check", "color": "red"},
-                {"type": "tile", "entity": d_eid,
-                 "name": f"Discarded (7d){label}", "icon": "mdi:account-off"},
-            ]
+            short = entry_label.get(e_id, e_id[:8])
+            if is_stat:
+                new_cards += [
+                    {"type": "statistic", "entity": p_eid, "name": f"Processed — {short}",
+                     "stat_type": "state", "period": period},
+                    {"type": "statistic", "entity": h_eid, "name": f"Human Detected — {short}",
+                     "stat_type": "state", "period": period},
+                    {"type": "statistic", "entity": d_eid, "name": f"Discarded — {short}",
+                     "stat_type": "state", "period": period},
+                ]
+            else:
+                new_cards += [
+                    {"type": "tile", "entity": p_eid, "name": f"Processed (7d) — {short}",
+                     "icon": "mdi:image-multiple"},
+                    {"type": "tile", "entity": h_eid, "name": f"Human Detected (7d) — {short}",
+                     "icon": "mdi:account-check", "color": "red"},
+                    {"type": "tile", "entity": d_eid, "name": f"Discarded (7d) — {short}",
+                     "icon": "mdi:account-off"},
+                ]
+        if cards != new_cards:
+            section["cards"] = new_cards
             changed = True
-        break
-
-    # ── 7-Day Summary — add statistic cards for missing entries ───────────────
-    for section in sections:
-        cards = section.get("cards", [])
-        if not any(c.get("heading") == "7-Day Summary" for c in cards):
-            continue
-        existing = {c.get("entity") for c in cards}
-        for p_eid in all_processed:
-            if p_eid in existing:
-                continue
-            suffix = p_eid[len("sensor.tuya_cameras_ai_processed_7d"):]
-            h_eid  = f"sensor.tuya_cameras_ai_human_detected_7d{suffix}"
-            d_eid  = f"sensor.tuya_cameras_ai_discarded_7d{suffix}"
-            label  = f" ({suffix.lstrip('_')})" if suffix else ""
-            period = {"calendar": {"period": "week"}}
-            cards += [
-                {"type": "statistic", "entity": p_eid,
-                 "name": f"Processed{label}", "stat_type": "state", "period": period},
-                {"type": "statistic", "entity": h_eid,
-                 "name": f"Human Detected{label}", "stat_type": "state", "period": period},
-                {"type": "statistic", "entity": d_eid,
-                 "name": f"Discarded{label}", "stat_type": "state", "period": period},
-            ]
-            changed = True
-        break
 
     if changed:
-        _LOGGER.debug("Lovelace: AI Detections view patched (%d last-human areas)", len(last_human))
+        _LOGGER.debug("Lovelace: AI Detections view patched (%d areas, %d entries)",
+                      len(last_human), len(sorted_entry_ids))
     return changed
 
 
