@@ -1,4 +1,4 @@
-"""Camera sensors — SD usage and online status."""
+"""Camera sensors — SD usage, online status, and animal detection config."""
 
 from __future__ import annotations
 
@@ -8,13 +8,20 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .ai_stats import AIStats
-from .const import DOMAIN, EVENT_AI_UPDATED
+from .const import (
+    CONF_ANIMAL_CLASSES,
+    CONF_ANIMAL_ENABLED,
+    CONF_CAMERA_ANIMAL_CONFIG,
+    DOMAIN,
+    EVENT_AI_UPDATED,
+)
 from .coordinator import CameraCoordinator
 
 
@@ -32,6 +39,7 @@ async def async_setup_entry(
     for dev_id, cam in cameras.items():
         entities.append(CameraSDSensor(coordinator, entry, dev_id, cam))
         entities.append(CameraOnlineSensor(coordinator, entry, dev_id, cam))
+        entities.append(CameraAnimalSensor(coordinator, entry, dev_id, cam))
 
     if ai_stats is not None:
         for stat in ("total", "human", "other"):
@@ -125,6 +133,36 @@ class CameraOnlineSensor(CoordinatorEntity[CameraCoordinator], SensorEntity):
     def extra_state_attributes(self) -> dict:
         c = self._cam
         return {"area": c.get("area"), "device_id": self._dev_id}
+
+
+class CameraAnimalSensor(CoordinatorEntity[CameraCoordinator], SensorEntity):
+    """Animal detection configuration for one camera — reads live from entry options."""
+
+    _attr_has_entity_name  = True
+    _attr_name             = "Animal Detection"
+    _attr_icon             = "mdi:paw"
+    _attr_entity_category  = EntityCategory.DIAGNOSTIC
+
+    def __init__(
+        self,
+        coordinator: CameraCoordinator,
+        entry: ConfigEntry,
+        dev_id: str,
+        cam: dict,
+    ) -> None:
+        super().__init__(coordinator)
+        self._dev_id           = dev_id
+        self._entry            = entry
+        self._attr_unique_id   = f"{entry.entry_id}_{dev_id}_animal"
+        self._attr_device_info = _device_info(entry, cam)
+
+    @property
+    def native_value(self) -> str:
+        cfg     = self._entry.options.get(CONF_CAMERA_ANIMAL_CONFIG, {}).get(self._dev_id, {})
+        if not cfg.get(CONF_ANIMAL_ENABLED):
+            return "off"
+        classes = cfg.get(CONF_ANIMAL_CLASSES, [])
+        return ", ".join(classes) if classes else "any animal"
 
 
 _STAT_LABELS = {

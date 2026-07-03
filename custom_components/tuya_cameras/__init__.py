@@ -15,6 +15,7 @@ from .ai_stats import AIStats
 from .camera_api import CameraAPI
 from .const import (
     CONF_AI_ENABLED, CONF_AI_URL,
+    CONF_CAMERA_ANIMAL_CONFIG,
     CONF_CORE_ENTRY_ID, CONF_RECIPIENTS, CONF_REFRESH_DAYS, DEFAULT_REFRESH_DAYS,
     CONF_MQTT_ALERTS_ENABLED, CONF_WEBHOOK_ALERTS_ENABLED,
     CONF_SMTP_HOST, CONF_SMTP_PASSWORD, CONF_SMTP_PORT, CONF_SMTP_SENDER,
@@ -114,6 +115,8 @@ async def _update_lovelace_views(hass: HomeAssistant) -> None:
     # Build: lowercase camera name → {entity IDs, area, camera entity_id}
     cam_info: dict[str, dict] = {}
     for entry_id, data in domain_data.items():
+        if not isinstance(data, dict) or "coordinator" not in data:
+            continue
         cam_data = (data.get("coordinator").data or {}).get("cameras", {})
         for dev_id, cam in cam_data.items():
             name = cam.get("name", "").strip()
@@ -123,6 +126,8 @@ async def _update_lovelace_views(hass: HomeAssistant) -> None:
             sd_eid     = registry.async_get_entity_id("sensor", DOMAIN, f"{entry_id}_{dev_id}_sd_pct")
             online_eid = registry.async_get_entity_id("sensor", DOMAIN, f"{entry_id}_{dev_id}_online")
             fmt_eid    = registry.async_get_entity_id("button", DOMAIN, f"{entry_id}_{dev_id}_format_sd")
+            animal_eid = registry.async_get_entity_id("sensor", DOMAIN, f"{entry_id}_{dev_id}_animal")
+            animal_enabled = data.get("animal_cfg", {}).get(dev_id, {}).get("enabled", False)
             # Find the official HA camera entity (created by the Tuya integration)
             cam_entity = None
             for entry in registry.entities.values():
@@ -133,8 +138,11 @@ async def _update_lovelace_views(hass: HomeAssistant) -> None:
                     cam_entity = entry.entity_id
                     break
             if sd_eid or online_eid:
-                cam_info[name.lower()] = {
+                name_key = name.lower()
+                existing_animal = cam_info.get(name_key, {}).get("animal")
+                cam_info[name_key] = {
                     "sd": sd_eid, "online": online_eid, "fmt": fmt_eid,
+                    "animal": (animal_eid if animal_enabled else None) or existing_animal,
                     "area": area, "camera_entity": cam_entity, "name": name,
                 }
 
@@ -226,9 +234,10 @@ def _patch_cameras_view(view: dict, cam_info: dict) -> bool:
                 continue
             cameras_with_cards.add(norm)
             new_entities = [e for e in [
-                {"entity": cam["sd"]}     if cam["sd"]     else None,
-                {"entity": cam["online"]} if cam["online"] else None,
-                {"entity": cam["fmt"]}    if cam["fmt"]    else None,
+                {"entity": cam["sd"]}     if cam["sd"]          else None,
+                {"entity": cam["online"]} if cam["online"]       else None,
+                {"entity": cam["fmt"]}    if cam["fmt"]          else None,
+                {"entity": cam["animal"]} if cam.get("animal")   else None,
             ] if e]
             if new_entities and card.get("entities") != new_entities:
                 card["entities"] = new_entities
@@ -293,9 +302,10 @@ def _patch_cameras_view(view: dict, cam_info: dict) -> bool:
             "camera_image": cam["camera_entity"],
             "camera_view": "live",
             "entities": [e for e in [
-                {"entity": cam["sd"]}     if cam["sd"]     else None,
-                {"entity": cam["online"]} if cam["online"] else None,
-                {"entity": cam["fmt"]}    if cam["fmt"]    else None,
+                {"entity": cam["sd"]}     if cam["sd"]          else None,
+                {"entity": cam["online"]} if cam["online"]       else None,
+                {"entity": cam["fmt"]}    if cam["fmt"]          else None,
+                {"entity": cam["animal"]} if cam.get("animal")   else None,
             ] if e],
         }
         sections[target_idx]["cards"].append(new_card)
@@ -484,6 +494,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     mqtt_enabled    = entry.options.get(CONF_MQTT_ALERTS_ENABLED, True)
     webhook_enabled = entry.options.get(CONF_WEBHOOK_ALERTS_ENABLED, False)
+    animal_cfg      = entry.options.get(CONF_CAMERA_ANIMAL_CONFIG, {})
 
     bridge = TuyaMQTTBridge(
         hass           = hass,
@@ -499,17 +510,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ai_stats       = ai_stats,
         alerts_enabled = mqtt_enabled,
         entry_label    = entry.title,
+        animal_cfg     = animal_cfg,
     )
 
     domain_data = hass.data.setdefault(DOMAIN, {})
     domain_data[entry.entry_id] = {
-        "coordinator":           coordinator,
-        "core_coord":            core_coord,
-        "camera_api":            camera_api,
-        "notifier":              notifier,
-        "bridge":                bridge,
-        "ai_stats":              ai_stats,
+        "coordinator":            coordinator,
+        "core_coord":             core_coord,
+        "camera_api":             camera_api,
+        "notifier":               notifier,
+        "bridge":                 bridge,
+        "ai_stats":               ai_stats,
         "webhook_alerts_enabled": webhook_enabled,
+        "animal_cfg":             animal_cfg,
     }
 
     # Start global webhook bridge if any entry has it enabled and it isn't running yet
@@ -542,6 +555,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await _cleanup_stale_entities()
 
     bridge.start(hass)
+    hass.async_create_task(_update_lovelace_views(hass))
     _LOGGER.info(
         "Tuya Cameras loaded: %d camera(s), refresh every %d day(s)",
         len((coordinator.data or {}).get("cameras", {})),

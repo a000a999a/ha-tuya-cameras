@@ -52,3 +52,12 @@ EVENT_AI_UPDATED = f"{DOMAIN}_ai_updated"
 CONF_MQTT_ALERTS_ENABLED    = "mqtt_alerts_enabled"
 CONF_WEBHOOK_ALERTS_ENABLED = "webhook_alerts_enabled"
 WEBHOOK_ID                  = "smartlife_motion"
+
+# Per-camera animal detection (stored in options as {device_id: {enabled, classes}})
+CONF_CAMERA_ANIMAL_CONFIG = "camera_animal_config"
+CONF_ANIMAL_ENABLED       = "enabled"
+CONF_ANIMAL_CLASSES       = "classes"
+ANIMAL_COCO_CLASSES = [
+    "bird", "cat", "dog", "horse", "sheep",
+    "cow", "elephant", "bear", "zebra", "giraffe",
+]

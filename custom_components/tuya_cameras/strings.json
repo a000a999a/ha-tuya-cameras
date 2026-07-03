@@ -38,7 +38,8 @@
           "edit_recipients": "Edit area recipients",
           "edit_settings":   "Refresh interval & SD alert threshold",
           "edit_ai":         "AI human detection",
-          "edit_alerts":     "Motion alert sources"
+          "edit_alerts":     "Motion alert sources",
+          "edit_animal":     "Camera animal detection"
         }
       },
       "edit_settings": {
@@ -88,10 +89,23 @@
         "error": {
           "ai_unreachable": "Cannot reach the inference service. Check the URL and that docker compose is running."
         }
+      },
+      "edit_animal": {
+        "title": "Select Camera",
+        "data": { "device_id": "Camera to configure" }
+      },
+      "edit_animal_config": {
+        "title": "Animal Detection — {camera}",
+        "description": "When enabled, motion images that contain a matching animal also trigger an email. Leave the class list empty to alert on any animal.",
+        "data": {
+          "enabled": "Enable animal detection",
+          "classes": "Animal classes to detect"
+        }
       }
     },
     "abort": {
-      "no_areas": "No areas found in coordinator data."
+      "no_areas":   "No areas found in coordinator data.",
+      "no_cameras": "No cameras found. Try Refresh All first."
     }
   }
 }

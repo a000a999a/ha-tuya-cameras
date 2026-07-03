@@ -59,6 +59,7 @@ class TuyaMQTTBridge:
         ai_stats: AIStats | None = None,
         alerts_enabled: bool = True,
         entry_label: str = "",
+        animal_cfg: dict | None = None,
     ) -> None:
         self._hass           = hass
         self._tuya_client    = tuya_client
@@ -73,6 +74,7 @@ class TuyaMQTTBridge:
         self._ai_stats       = ai_stats
         self._alerts_enabled = alerts_enabled
         self._entry_label    = entry_label or uid  # used in tech alerts + motion email source tag
+        self._animal_cfg     = animal_cfg or {}    # {device_id: {enabled, classes}}
         self._task: asyncio.Task | None = None
         self._watchdog_task: asyncio.Task | None = None
         self._local_keys: dict[str, str] = {}    # device_id → local_key
@@ -498,7 +500,8 @@ class TuyaMQTTBridge:
                 return
 
         # ── AI filtering ──────────────────────────────────────────────────────
-        email_image = img_bytes  # may be replaced with annotated image
+        email_image    = img_bytes  # may be replaced with annotated image
+        detected_label: str | None = None  # set when animal (or human+animal) detected
 
         if self._ai_client is not None:
             if not img_bytes:
@@ -508,33 +511,49 @@ class TuyaMQTTBridge:
             ai_result = prefetched_ai if prefetched_ai is not None else await self._ai_client.analyze(img_bytes)
 
             if ai_result is None:
-                # Service unreachable or timed out — fail-open, email original image
+                # Service unreachable — fail-open on human path; animal path stays silent
                 _LOGGER.warning("Motion %s/%s: AI service unavailable — failing open", area, name)
-            elif not ai_result["human"]:
-                _LOGGER.debug(
-                    "Motion %s/%s: no human detected (conf=%.2f) — discarding",
-                    area, name, ai_result["confidence"],
-                )
-                if self._ai_stats:
-                    await self._ai_stats.async_record(human=False, area=area, camera=name)
-                    self._hass.bus.async_fire(EVENT_AI_UPDATED)
-                return
             else:
-                _LOGGER.info(
-                    "Motion %s/%s: human detected (conf=%.2f) — alerting",
-                    area, name, ai_result["confidence"],
-                )
+                human_found  = ai_result["human"]
+                animal_label = self._check_animal(dev_id, ai_result)
+
+                if not human_found and animal_label is None:
+                    _LOGGER.debug(
+                        "Motion %s/%s: no human or animal detected (conf=%.2f) — discarding",
+                        area, name, ai_result["confidence"],
+                    )
+                    if self._ai_stats:
+                        await self._ai_stats.async_record(human=False, area=area, camera=name)
+                        self._hass.bus.async_fire(EVENT_AI_UPDATED)
+                    return
+
+                if human_found:
+                    _LOGGER.info(
+                        "Motion %s/%s: human detected (conf=%.2f) — alerting",
+                        area, name, ai_result["confidence"],
+                    )
+                if animal_label:
+                    _LOGGER.info("Motion %s/%s: animal detected (%s) — alerting", area, name, animal_label)
+
                 if self._ai_stats:
-                    await self._ai_stats.async_record(human=True, area=area, camera=name)
+                    await self._ai_stats.async_record(human=human_found, area=area, camera=name)
                     self._hass.bus.async_fire(EVENT_AI_UPDATED)
                 email_image = ai_result.get("annotated_image", img_bytes)
+
+                if human_found and animal_label:
+                    detected_label = f"human + {animal_label}"
+                elif animal_label:
+                    detected_label = animal_label
         # ─────────────────────────────────────────────────────────────────────
 
         snap_row = (
             f'<tr><td><b>Note</b></td><td style="color:#e67e22;">{snap_note}</td></tr>'
             if snap_note else ""
         )
-        subject = f"Motion detected — {area} / {name} [MQTT]"
+        if detected_label:
+            subject = f"{detected_label.capitalize()} detected — {area} / {name} [MQTT]"
+        else:
+            subject = f"Motion detected — {area} / {name} [MQTT]"
         body    = f"""<html><body>
 <h2 style="color:#c0392b;">Motion Detected</h2>
 <table>
@@ -557,6 +576,16 @@ class TuyaMQTTBridge:
                     self._notifier.send, subject, body, to_addrs, email_image
                 )
                 _LOGGER.info("Motion alert sent for %s/%s to %s", area, name, to_addrs)
+
+    def _check_animal(self, dev_id: str, ai_result: dict) -> str | None:
+        """Return first matched animal class label if animal detection is enabled for this camera."""
+        cam_cfg = self._animal_cfg.get(dev_id, {})
+        if not cam_cfg.get("enabled"):
+            return None
+        detected = ai_result.get("animals", [])
+        allowed  = cam_cfg.get("classes", [])
+        matches  = [a for a in detected if not allowed or a in allowed]
+        return matches[0] if matches else None
 
     async def _find_camera_entity_id(self, dev_id: str) -> str | None:
         """Look up the HA camera entity ID for a Tuya device ID."""

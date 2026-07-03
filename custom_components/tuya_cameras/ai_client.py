@@ -50,6 +50,7 @@ class AIClient:
                     b64 = result.pop("annotated_image_b64", None)
                     if b64:
                         result["annotated_image"] = base64.b64decode(b64)
+                    result.setdefault("animals", [])
                     return result
         except asyncio.TimeoutError:
             _LOGGER.warning("AI service timeout after %ds — will fail-open", TIMEOUT)

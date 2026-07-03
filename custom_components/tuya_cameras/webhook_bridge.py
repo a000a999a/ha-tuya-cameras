@@ -13,6 +13,19 @@ from .const import DOMAIN, WEBHOOK_ID
 _LOGGER = logging.getLogger(__name__)
 
 
+def _check_animal_cfg(animal_cfg: dict, dev_id: str | None, ai_result: dict | None) -> str | None:
+    """Return first matched animal class label if animal detection is enabled for this camera."""
+    if not dev_id or not ai_result:
+        return None
+    cam_cfg = animal_cfg.get(dev_id, {})
+    if not cam_cfg.get("enabled"):
+        return None
+    detected = ai_result.get("animals", [])
+    allowed  = cam_cfg.get("classes", [])
+    matches  = [a for a in detected if not allowed or a in allowed]
+    return matches[0] if matches else None
+
+
 class SmartLifeWebhookBridge:
     def __init__(self, hass: Any) -> None:
         self._hass = hass
@@ -87,6 +100,8 @@ class SmartLifeWebhookBridge:
             bridge._get_recipients(area, "human")
             if bridge else self._all_human_recipients()
         )
+        animal_cfg     = entry_data.get("animal_cfg", {}) if entry_data else {}
+        detected_label: str | None = None
 
         # ── No image — fall back to RTSP snapshots ────────────────────────────
         # Camera Door (and potentially other cameras) uses a plain notification
@@ -126,8 +141,20 @@ class SmartLifeWebhookBridge:
                             self._hass.bus.async_fire(f"{DOMAIN}_ai_updated")
                         img_bytes = result.get("annotated_image", snap)
                         break
+                    animal = _check_animal_cfg(animal_cfg, dev_id, result)
+                    if animal:
+                        _LOGGER.info(
+                            "SmartLife webhook %s/%s: animal (%s) found in RTSP snapshot at +%ds",
+                            area, cam_name, animal, delay,
+                        )
+                        if ai_stats:
+                            await ai_stats.async_record(human=False, area=area, camera=cam_name)
+                            self._hass.bus.async_fire(f"{DOMAIN}_ai_updated")
+                        img_bytes = result.get("annotated_image", snap)
+                        detected_label = animal
+                        break
                     _LOGGER.debug(
-                        "SmartLife webhook %s/%s: no human in RTSP snapshot at +%ds (conf=%.2f)",
+                        "SmartLife webhook %s/%s: no human or animal in RTSP snapshot at +%ds (conf=%.2f)",
                         area, cam_name, delay, result["confidence"] if result else 0.0,
                     )
                 else:
@@ -136,7 +163,7 @@ class SmartLifeWebhookBridge:
                     break
             if not img_bytes:
                 _LOGGER.debug(
-                    "SmartLife webhook %s/%s: no human found in any RTSP snapshot — discarding",
+                    "SmartLife webhook %s/%s: no human or animal found in any RTSP snapshot — discarding",
                     area, cam_name,
                 )
                 if ai_stats:
@@ -152,14 +179,22 @@ class SmartLifeWebhookBridge:
                     "SmartLife webhook %s/%s: AI service unavailable — failing open", area, cam_name
                 )
             elif not result["human"]:
-                _LOGGER.debug(
-                    "SmartLife webhook %s/%s: no human detected (conf=%.2f) — discarding",
-                    area, cam_name, result["confidence"],
-                )
+                animal = _check_animal_cfg(animal_cfg, dev_id, result)
+                if animal is None:
+                    _LOGGER.debug(
+                        "SmartLife webhook %s/%s: no human or animal detected (conf=%.2f) — discarding",
+                        area, cam_name, result["confidence"],
+                    )
+                    if ai_stats:
+                        await ai_stats.async_record(human=False, area=area, camera=cam_name)
+                        self._hass.bus.async_fire(f"{DOMAIN}_ai_updated")
+                    return
+                _LOGGER.info("SmartLife webhook %s/%s: animal detected (%s) — alerting", area, cam_name, animal)
                 if ai_stats:
                     await ai_stats.async_record(human=False, area=area, camera=cam_name)
                     self._hass.bus.async_fire(f"{DOMAIN}_ai_updated")
-                return
+                img_bytes      = result.get("annotated_image", img_bytes)
+                detected_label = animal
             else:
                 _LOGGER.info(
                     "SmartLife webhook %s/%s: human detected (conf=%.2f) — alerting",
@@ -183,7 +218,10 @@ class SmartLifeWebhookBridge:
             return
 
         ev_ts   = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        subject = f"Motion detected — {area} / {cam_name} [SmartLife]"
+        if detected_label:
+            subject = f"{detected_label.capitalize()} detected — {area} / {cam_name} [SmartLife]"
+        else:
+            subject = f"Motion detected — {area} / {cam_name} [SmartLife]"
         body    = (
             f"<html><body>"
             f"<h2 style='color:#c0392b;'>Motion Detected</h2>"

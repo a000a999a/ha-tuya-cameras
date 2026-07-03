@@ -9,8 +9,12 @@ from homeassistant.helpers import selector
 
 from .ai_client import AIClient
 from .const import (
+    ANIMAL_COCO_CLASSES,
     CONF_AI_ENABLED,
     CONF_AI_URL,
+    CONF_ANIMAL_CLASSES,
+    CONF_ANIMAL_ENABLED,
+    CONF_CAMERA_ANIMAL_CONFIG,
     CONF_MQTT_ALERTS_ENABLED,
     CONF_WEBHOOK_ALERTS_ENABLED,
     WEBHOOK_ID,
@@ -172,14 +176,16 @@ class TuyaCamerasOptionsFlow(OptionsFlow):
     """Options: update SMTP or edit per-area recipients."""
 
     def __init__(self, config_entry: ConfigEntry) -> None:
-        self._entry        = config_entry
-        self._recipients   = dict(config_entry.options.get(CONF_RECIPIENTS, {}))
-        self._selected_area: str = ""
+        self._entry               = config_entry
+        self._recipients          = dict(config_entry.options.get(CONF_RECIPIENTS, {}))
+        self._selected_area:      str = ""
+        self._selected_device_id: str = ""
+        self._animal_camera_name: str = ""
 
     async def async_step_init(self, user_input: dict | None = None) -> ConfigFlowResult:
         return self.async_show_menu(
             step_id="init",
-            menu_options=["edit_smtp", "edit_recipients", "edit_settings", "edit_ai", "edit_alerts"],
+            menu_options=["edit_smtp", "edit_recipients", "edit_settings", "edit_ai", "edit_alerts", "edit_animal"],
         )
 
     async def async_step_edit_settings(self, user_input: dict | None = None) -> ConfigFlowResult:
@@ -321,4 +327,64 @@ class TuyaCamerasOptionsFlow(OptionsFlow):
         })
         return self.async_show_form(
             step_id="edit_ai", data_schema=schema, errors=errors
+        )
+
+    async def async_step_edit_animal(self, user_input: dict | None = None) -> ConfigFlowResult:
+        """Pick which camera to configure for animal detection."""
+        cam_data = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+        coord    = cam_data.get("coordinator")
+        cameras: dict[str, str] = {}  # device_id → display name
+        if coord and coord.data:
+            for dev_id, cam in coord.data.get("cameras", {}).items():
+                cameras[dev_id] = cam.get("name", dev_id)
+
+        if not cameras:
+            return self.async_abort(reason="no_cameras")
+
+        if user_input is not None:
+            self._selected_device_id = user_input["device_id"]
+            self._animal_camera_name = cameras.get(self._selected_device_id, self._selected_device_id)
+            return await self.async_step_edit_animal_config()
+
+        schema = vol.Schema({
+            vol.Required("device_id"): selector.SelectSelector(
+                selector.SelectSelectorConfig(options=[
+                    selector.SelectOptionDict(value=dev_id, label=name)
+                    for dev_id, name in sorted(cameras.items(), key=lambda x: x[1])
+                ])
+            )
+        })
+        return self.async_show_form(step_id="edit_animal", data_schema=schema)
+
+    async def async_step_edit_animal_config(self, user_input: dict | None = None) -> ConfigFlowResult:
+        """Configure animal detection for the selected camera."""
+        device_id   = self._selected_device_id
+        current_cfg = self._entry.options.get(CONF_CAMERA_ANIMAL_CONFIG, {}).get(device_id, {})
+
+        if user_input is not None:
+            animal_cfg          = dict(self._entry.options.get(CONF_CAMERA_ANIMAL_CONFIG, {}))
+            animal_cfg[device_id] = {
+                CONF_ANIMAL_ENABLED: user_input.get(CONF_ANIMAL_ENABLED, False),
+                CONF_ANIMAL_CLASSES: user_input.get(CONF_ANIMAL_CLASSES, []),
+            }
+            new_options = {
+                **self._entry.options,
+                CONF_RECIPIENTS:          self._recipients,
+                CONF_CAMERA_ANIMAL_CONFIG: animal_cfg,
+            }
+            return self.async_create_entry(data=new_options)
+
+        schema = vol.Schema({
+            vol.Optional(CONF_ANIMAL_ENABLED, default=current_cfg.get(CONF_ANIMAL_ENABLED, False)):
+                selector.BooleanSelector(),
+            vol.Optional(CONF_ANIMAL_CLASSES, default=current_cfg.get(CONF_ANIMAL_CLASSES, [])):
+                selector.SelectSelector(selector.SelectSelectorConfig(
+                    options=ANIMAL_COCO_CLASSES,
+                    multiple=True,
+                )),
+        })
+        return self.async_show_form(
+            step_id="edit_animal_config",
+            data_schema=schema,
+            description_placeholders={"camera": self._animal_camera_name},
         )
