@@ -119,7 +119,7 @@ class TuyaMQTTBridge:
                 refresh_at  = time.monotonic() + expire_s - RECONNECT_BUFFER_S
                 full_pw     = creds["password"]
                 key         = full_pw[8:24].encode()   # AES-128-ECB envelope key
-                _LOGGER.debug("MQTT password len=%d prefix=%s", len(full_pw), full_pw[:8])
+                _LOGGER.debug("MQTT password len=%d", len(full_pw))
 
                 loop = asyncio.get_event_loop()
                 disconnect_event = asyncio.Event()
