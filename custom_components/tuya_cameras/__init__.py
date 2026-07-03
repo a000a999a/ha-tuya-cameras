@@ -50,6 +50,8 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         new_cameras_detected = False
 
         for entry_id, data in list(entries.items()):
+            if not isinstance(data, dict):
+                continue
             core_coord = data.get("core_coord")
             cam_coord  = data.get("coordinator")
 
@@ -84,7 +86,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                         _LOGGER.info("refresh_all: removing stale entity %s (device removed from account)", entity.entity_id)
                         registry.async_remove(entity.entity_id)
 
-        _LOGGER.info("refresh_all: done (%d entries refreshed)", len(entries))
+        _LOGGER.info("refresh_all: done (%d entries refreshed)", sum(1 for v in entries.values() if isinstance(v, dict)))
 
         if new_cameras_detected:
             # Allow entity registration to settle after config entry reload
