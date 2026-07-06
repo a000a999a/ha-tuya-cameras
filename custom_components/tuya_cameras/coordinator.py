@@ -16,6 +16,27 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 
+def _parse_sd_storge(status: dict) -> dict:
+    """Parse Tuya 'sd_storge' value 'total_kb|used_kb|free_kb' into coordinator SD fields."""
+    raw = status.get("sd_storge", "")
+    sd_status_code = status.get("sd_status")
+    if not isinstance(raw, str) or "|" not in raw:
+        return {}
+    try:
+        total_kb, used_kb, free_kb = (int(x) for x in raw.split("|"))
+    except (ValueError, IndexError):
+        return {}
+    if total_kb == 0:
+        return {"sd_status": "no_card" if sd_status_code != 1 else "unknown"}
+    return {
+        "sd_pct":      round(used_kb / total_kb * 100, 1),
+        "sd_used_gb":  round(used_kb  / 1_048_576, 1),
+        "sd_total_gb": round(total_kb / 1_048_576, 1),
+        "sd_free_gb":  round(free_kb  / 1_048_576, 1),
+        "sd_status":   "normal" if sd_status_code == 1 else "error",
+    }
+
+
 class CameraCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """
     Refreshes camera list and SD status on a user-configurable interval (default 14 days).
@@ -81,12 +102,43 @@ class CameraCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     _LOGGER.warning("SD poll failed for %s: %s", dev_id, err)
             cam_map[dev_id] = {**cam, **sd}
 
+        # IoT API unavailable — fall back to tuya_sharing device_map for SD data
+        if not devices:
+            sd_data = await self._fetch_sd_from_tuya_sharing(set(cam_map.keys()))
+            for dev_id, sd in sd_data.items():
+                if dev_id in cam_map:
+                    cam_map[dev_id].update(sd)
+            if sd_data:
+                with_pct = sum(1 for sd in sd_data.values() if "sd_pct" in sd)
+                _LOGGER.info(
+                    "SD data sourced from tuya_sharing for %d camera(s) (%d with usage data)",
+                    len(sd_data), with_pct,
+                )
+
         if not cam_map and self.data:
             _LOGGER.warning("Camera refresh returned no cameras — keeping stale data")
             return self.data
 
         _LOGGER.debug("Camera coordinator refreshed: %d cameras", len(cam_map))
         return {"cameras": cam_map}
+
+    async def _fetch_sd_from_tuya_sharing(self, dev_ids: set[str]) -> dict[str, dict]:
+        """Borrow the official Tuya integration's tuya_sharing manager to read SD status."""
+        result: dict[str, dict] = {}
+        try:
+            for entry in self.hass.config_entries.async_entries("tuya"):
+                runtime = getattr(entry, "runtime_data", None)
+                manager = getattr(runtime, "manager", None)
+                if not manager or not hasattr(manager, "device_map"):
+                    continue
+                for dev_id in dev_ids:
+                    if dev_id in manager.device_map and dev_id not in result:
+                        sd = _parse_sd_storge(manager.device_map[dev_id].status)
+                        if sd:
+                            result[dev_id] = sd
+        except Exception as err:
+            _LOGGER.debug("tuya_sharing SD fetch failed: %s", err)
+        return result
 
     def _cameras_from_registry(self) -> list[dict]:
         """Build camera list from HA entity/device/area registry when Tuya API is unavailable.

@@ -6,7 +6,8 @@ import asyncio
 import logging
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import entity_registry as er
 
@@ -474,6 +475,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await coordinator.async_config_entry_first_refresh()
     except Exception as err:
         raise ConfigEntryNotReady(f"Camera status unavailable: {err}") from err
+
+    # Other integrations (e.g. official Tuya hub) may not have finished loading yet
+    # at first-refresh time. Schedule a second refresh after HA startup to pick up
+    # runtime_data from those entries (needed for tuya_sharing SD data fallback).
+    if not hass.is_running:
+        @callback
+        def _post_start_refresh(_event=None):
+            hass.async_create_task(coordinator.async_refresh())
+        entry.async_on_unload(
+            hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _post_start_refresh)
+        )
 
     recipients = entry.options.get(CONF_RECIPIENTS, {})
     uid        = core.get("uid", "")

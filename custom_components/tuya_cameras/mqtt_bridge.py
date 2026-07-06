@@ -904,7 +904,7 @@ class TuyaMQTTBridge:
         def _check(dec: bytes, mode_label: str, label: str) -> str | None:
             """Return plaintext if looks like a path, or JPEG sentinel if JPEG magic."""
             if dec[:2] == b"\xff\xd8":
-                _LOGGER.debug("v4 decrypt: JPEG magic with %s/%s", label, mode_label)
+                _LOGGER.debug("v4 decrypt: JPEG magic (mode=%s)", mode_label)
                 return "\xff\xd8JPEG"
             printable = sum(1 for b in dec if 32 <= b < 127)
             ratio = printable / max(len(dec), 1)
