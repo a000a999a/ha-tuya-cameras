@@ -73,20 +73,23 @@ class CameraCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
     async def _async_update_data(self) -> dict[str, Any]:
-        core_data = self._core_coordinator.data or {}
-        devices   = core_data.get("devices", [])
-        area_map  = core_data.get("areas", {})
+        core_data    = self._core_coordinator.data or {}
+        devices      = core_data.get("devices", [])
+        area_map     = core_data.get("areas", {})
+        hub_entry_id = core_data.get("hub_entry_id", "")
 
         cameras = await self.hass.async_add_executor_job(
             self._camera_api.cameras_from_devices, devices, area_map
         )
 
         if not cameras:
-            cameras = self._cameras_from_registry()
+            cameras = self._cameras_from_registry(hub_entry_id)
             if cameras:
                 _LOGGER.info(
-                    "Tuya device API unavailable — %d cameras loaded from HA entity registry",
+                    "Tuya device API unavailable — %d cameras loaded from HA entity registry%s",
                     len(cameras),
+                    "" if hub_entry_id else " (UNSCOPED — no linked Tuya hub configured in "
+                                            "tuya_home_core; may include other projects' cameras)",
                 )
 
         cam_map: dict[str, dict] = {}
@@ -140,11 +143,16 @@ class CameraCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.debug("tuya_sharing SD fetch failed: %s", err)
         return result
 
-    def _cameras_from_registry(self) -> list[dict]:
+    def _cameras_from_registry(self, hub_entry_id: str = "") -> list[dict]:
         """Build camera list from HA entity/device/area registry when Tuya API is unavailable.
 
         The official HA Tuya hub registers cameras with unique_id "tuya.{device_id}".
         Device names and area assignments come from the device + area registries.
+
+        Scoped to `hub_entry_id` (the official "tuya" hub linked to this project in
+        tuya_home_core) when set, so this project's cameras never mix with another
+        project's. If unset, falls back to the old unscoped behaviour (logs a warning
+        at the call site) — configure "Linked Tuya hub" in tuya_home_core to fix.
         """
         entity_reg = er.async_get(self.hass)
         device_reg = dr.async_get(self.hass)
@@ -161,15 +169,17 @@ class CameraCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             name      = entity.name or entity.original_name or dev_id
             area_name = ""
+            device    = device_reg.async_get(entity.device_id) if entity.device_id else None
 
-            if entity.device_id:
-                device = device_reg.async_get(entity.device_id)
-                if device:
-                    name = device.name_by_user or device.name or name
-                    if device.area_id:
-                        area = area_reg.async_get_area(device.area_id)
-                        if area:
-                            area_name = area.name
+            if hub_entry_id and (not device or hub_entry_id not in device.config_entries):
+                continue
+
+            if device:
+                name = device.name_by_user or device.name or name
+                if device.area_id:
+                    area = area_reg.async_get_area(device.area_id)
+                    if area:
+                        area_name = area.name
 
             cameras.append({"id": dev_id, "name": name, "area": area_name, "online": True})
 

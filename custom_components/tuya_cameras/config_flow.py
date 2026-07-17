@@ -157,8 +157,10 @@ class TuyaCamerasConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
     def _create(self) -> ConfigFlowResult:
+        core_entry = self.hass.config_entries.async_get_entry(self._core_entry_id)
+        title = core_entry.title if core_entry else "Tuya Cameras"
         return self.async_create_entry(
-            title="Tuya Cameras",
+            title=title,
             data={
                 CONF_CORE_ENTRY_ID: self._core_entry_id,
                 **self._smtp_data,
