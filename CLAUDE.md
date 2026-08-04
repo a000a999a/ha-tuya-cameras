@@ -110,6 +110,8 @@ Webhook pipeline coverage: all three account/entry types are covered by `_find_c
 - [ ] button unique_id = config_entry.entry_id + device_id + "format_sd"
 - [ ] notify.py must never raise — catch all SMTP exceptions and log them
 - [ ] Per-area recipients come from options entry only — never hardcoded
+- [ ] A detection with zero resolved recipients (empty/unmapped camera area) must WARN, never fail silently — both `mqtt_bridge.py` and `webhook_bridge.py` do this; keep them in sync
+- [ ] `coordinator.py`'s `_cameras_from_registry()` must WARN when a camera has no Area assigned — this is the root cause that makes the recipients warning above fire in the first place
 - [ ] OSS image download attempted before HA snapshot fallback
 - [ ] For ?param= signed URLs: try direct HTTP GET first, fall back to snapshot only on failure
 - [ ] Multi-snapshot loop (t=0/+2s/+4s) runs AI inline — do NOT add extra AI calls after the loop

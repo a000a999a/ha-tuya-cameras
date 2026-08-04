@@ -576,6 +576,13 @@ class TuyaMQTTBridge:
                     self._notifier.send, subject, body, to_addrs, email_image
                 )
                 _LOGGER.info("Motion alert sent for %s/%s to %s", area, name, to_addrs)
+        else:
+            _LOGGER.warning(
+                "Motion %s/%s: detection fired but no recipients configured for area %r — "
+                "email NOT sent. Check the camera's Area assignment and this project's "
+                "recipients config.",
+                area, name, area,
+            )
 
     def _check_animal(self, dev_id: str, ai_result: dict) -> str | None:
         """Return first matched animal class label if animal detection is enabled for this camera."""

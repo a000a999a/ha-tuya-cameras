@@ -181,6 +181,14 @@ class CameraCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     if area:
                         area_name = area.name
 
+            if not area_name:
+                _LOGGER.warning(
+                    "Camera '%s' (%s) has no area assigned in HA — motion alerts for it "
+                    "will have no configured recipients and will be silently dropped. "
+                    "Set an Area on its device entry (Settings > Devices & Services) to fix.",
+                    name, dev_id,
+                )
+
             cameras.append({"id": dev_id, "name": name, "area": area_name, "online": True})
 
         return cameras
