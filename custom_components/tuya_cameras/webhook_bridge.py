@@ -139,7 +139,8 @@ class SmartLifeWebhookBridge:
                         if ai_stats:
                             await ai_stats.async_record(human=True, area=area, camera=cam_name)
                             self._hass.bus.async_fire(f"{DOMAIN}_ai_updated")
-                        img_bytes = result.get("annotated_image", snap)
+                        img_bytes      = result.get("annotated_image", snap)
+                        detected_label = "human"
                         break
                     animal = _check_animal_cfg(animal_cfg, dev_id, result)
                     if animal:
@@ -203,7 +204,8 @@ class SmartLifeWebhookBridge:
                 if ai_stats:
                     await ai_stats.async_record(human=True, area=area, camera=cam_name)
                     self._hass.bus.async_fire(f"{DOMAIN}_ai_updated")
-                img_bytes = result.get("annotated_image", img_bytes)
+                img_bytes      = result.get("annotated_image", img_bytes)
+                detected_label = "human"
 
         if not recipients:
             _LOGGER.warning(

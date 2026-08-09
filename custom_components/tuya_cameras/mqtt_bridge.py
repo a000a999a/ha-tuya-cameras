@@ -544,6 +544,8 @@ class TuyaMQTTBridge:
                     detected_label = f"human + {animal_label}"
                 elif animal_label:
                     detected_label = animal_label
+                elif human_found:
+                    detected_label = "human"
         # ─────────────────────────────────────────────────────────────────────
 
         snap_row = (

@@ -127,6 +127,7 @@ Webhook pipeline coverage: all three account/entry types are covered by `_find_c
 - [ ] Android manifest: `usesCleartextTraffic="true"` on `<application>` — required for HTTP to local HA IP
 - [ ] Android multipart: NEVER use `DataOutputStream.writeBytes()` for user-visible text — use `out.write(s.toByteArray(Charsets.UTF_8))` to preserve accented characters
 - [ ] After installing new APK: force-stop the old process (`adb shell am force-stop com.alex.tuyabridge`) so new `onListenerConnected()` fires
+- [ ] `detected_label` must be set for every alerting path, not just the animal/human+animal ones — a human-only detection with no `elif human_found: detected_label = "human"` silently degrades the email subject to generic "Motion detected", masking working AI detection as broken (root cause of the 2026-08-06 v0.7.10 fix)
 
 ## DPS Event Codes
 - initiative_message: base64-encoded JSON — Brasil, Wallis, Germany cameras (newer firmware)
