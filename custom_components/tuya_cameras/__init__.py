@@ -115,11 +115,17 @@ async def _update_lovelace_views(hass: HomeAssistant) -> None:
     registry    = er.async_get(hass)
     domain_data = hass.data.get(DOMAIN, {})
 
-    # Build: lowercase camera name → {entity IDs, area, camera entity_id}
+    # Build: lowercase camera name → {entity IDs, project, camera entity_id}
     cam_info: dict[str, dict] = {}
     for entry_id, data in domain_data.items():
         if not isinstance(data, dict) or "coordinator" not in data:
             continue
+        config_entry = hass.config_entries.async_get_entry(entry_id)
+        # tuya_cameras entry title always inherits its linked tuya_home_core
+        # project's title (see config_flow.py _create()) — use it as the
+        # grouping key instead of HA Area, which is per-device, manually
+        # assigned, and empty for any camera not yet touched in Settings.
+        project = config_entry.title if config_entry else entry_id
         cam_data = (data.get("coordinator").data or {}).get("cameras", {})
         for dev_id, cam in cam_data.items():
             name = cam.get("name", "").strip()
@@ -146,7 +152,8 @@ async def _update_lovelace_views(hass: HomeAssistant) -> None:
                 cam_info[name_key] = {
                     "sd": sd_eid, "online": online_eid, "fmt": fmt_eid,
                     "animal": (animal_eid if animal_enabled else None) or existing_animal,
-                    "area": area, "camera_entity": cam_entity, "name": name,
+                    "area": area, "area_missing": not area, "dev_id": dev_id,
+                    "project": project, "camera_entity": cam_entity, "name": name,
                 }
 
     try:
@@ -189,6 +196,10 @@ async def _update_lovelace_views(hass: HomeAssistant) -> None:
                 if _patch_ai_detections_view(view, registry, hass):
                     changed = True
 
+        if any(c.get("area_missing") for c in cam_info.values()):
+            if _ensure_area_setup_view(config):
+                changed = True
+
         if changed:
             await dashboard.async_save(config)
             _LOGGER.info("Lovelace views updated (cameras: %d, ai-detections patched)", len(cam_info))
@@ -207,14 +218,66 @@ def _normalize_cam_title(title: str) -> str:
     return s.removeprefix("camera ").strip()
 
 
+_AREA_SETUP_VIEW_PATH = "tuya-area-setup"
+
+_AREA_SETUP_MARKDOWN = """\
+## ⚡ Area not set — motion-alert emails won't be sent for this camera
+
+**Why this matters:** Home Assistant Area is what routes a camera's motion-alert emails to the
+right recipients. It is completely separate from how cameras are grouped on the Cameras
+dashboard (that's based on the Tuya account/project and doesn't need Area). A camera can look
+perfectly normal here and still silently drop every detection email if its Area was never set.
+
+### How to fix it
+
+1. Go to **Settings → Devices & Services → Devices tab**.
+2. Search for the camera's name. **Two device entries will match** — this is expected.
+3. Open each one and check the **Integration** line at the top. Edit the one that says
+   **Tuya** — not **Tuya Cameras**. Setting Area on the Tuya Cameras entry has no effect on
+   email routing.
+4. Click the pencil/edit icon next to the device name → set **Area** to the correct location →
+   **Update**.
+5. Back on this Cameras dashboard, press **Refresh All Cameras** (or wait for the next scheduled
+   refresh) — the ⚡ warning icon clears automatically once Area is set correctly.
+
+If you're unsure which area name to use, it must match one of the existing "Recipients — area"
+entries configured under Tuya Cameras → Configure, otherwise the email will still have nowhere
+to go even with an Area set.
+"""
+
+
+def _ensure_area_setup_view(config: dict) -> bool:
+    """Create the 'Tuya Area Setup' documentation view if it doesn't exist yet.
+
+    Linked to from the ⚡ warning card injected next to any camera missing an
+    Area (see _patch_cameras_view Pass 4). Idempotent — never modifies an
+    already-existing view, so any manual edits to it are preserved.
+    """
+    views = config.setdefault("views", [])
+    if any(v.get("path") == _AREA_SETUP_VIEW_PATH for v in views):
+        return False
+    views.append({
+        "title": "Tuya Area Setup",
+        "path": _AREA_SETUP_VIEW_PATH,
+        "icon": "mdi:lightning-bolt",
+        "cards": [{"type": "markdown", "content": _AREA_SETUP_MARKDOWN}],
+    })
+    _LOGGER.info("Lovelace: created '%s' documentation view", _AREA_SETUP_VIEW_PATH)
+    return True
+
+
 def _patch_cameras_view(view: dict, cam_info: dict) -> bool:
     """
     Sync picture-glance cards in the Cameras view:
     - Update entity IDs for existing cards.
     - Remove cards for cameras no longer in any coordinator.
     - Add new picture-glance cards for cameras that have no card yet,
-      placed in the section that already contains cameras from the same area.
-      If no such section exists, a new section is created.
+      placed in the section that already contains cameras from the same
+      Tuya SDK project (tuya_cameras config entry). If no such section
+      exists, a new section is created. Grouped by project rather than HA
+      Area because Area is per-device, manually assigned, and empty for
+      any camera not yet touched in Settings — project membership is
+      always defined and never requires manual setup.
     """
     norm_map = {_normalize_cam_title(k): v for k, v in cam_info.items()}
     changed  = False
@@ -246,34 +309,116 @@ def _patch_cameras_view(view: dict, cam_info: dict) -> bool:
                 card["entities"] = new_entities
                 _LOGGER.debug("Lovelace: updated entities for card '%s'", title)
                 changed = True
+            if "camera_view" in card:
+                # Self-heal: strip any lingering "live" (or other forced)
+                # camera_view on every pass, not just newly-created cards —
+                # forces an immediate WebRTC/live stream per card, and go2rtc
+                # never retires stale producers (2026-08-10 finding), so
+                # simultaneous live cards pile up and starve each other.
+                # Default view does lightweight periodic snapshot polling.
+                del card["camera_view"]
+                _LOGGER.info("Lovelace: removed forced camera_view on card '%s'", title)
+                changed = True
             new_cards.append(card)
         if len(new_cards) != len(cards):
             section["cards"] = new_cards
 
-    # ── Pass 2: infer section → area mapping ─────────────────────────────
-    # Primary: find a picture-glance card whose camera has a known area
-    #   (avoids hardcoding heading ↔ area mismatches like "Winti" vs "Winterthur").
-    # Fallback: match heading text to a known area name
-    #   (handles sections left empty after camera removals, e.g. "Farm" section).
-    section_area: dict[int, str] = {}   # section_index → area name
-    known_areas = {v["area"].lower(): v["area"] for v in cam_info.values() if v.get("area")}
+    # ── Pass 2: infer section → project mapping ────────────────────────────
+    # Primary: find a picture-glance card whose camera has a known project
+    #   (project is always defined — unlike area, never needs a manual match).
+    # Fallback: match heading text to a known project name
+    #   (handles sections left empty after camera removals).
+    section_project: dict[int, str] = {}   # section_index → project name
+    known_projects = {v["project"].lower(): v["project"] for v in cam_info.values() if v.get("project")}
     for i, section in enumerate(view.get("sections", [])):
         for card in section.get("cards", []):
             if card.get("type") == "picture-glance":
                 norm = _normalize_cam_title(card.get("title", ""))
                 cam  = norm_map.get(norm)
-                if cam and cam.get("area"):
-                    section_area[i] = cam["area"]
+                if cam and cam.get("project"):
+                    section_project[i] = cam["project"]
                     break
-        if i in section_area:
+        if i in section_project:
             continue
-        # Fallback: match heading text to a known area name (case-insensitive)
+        # Fallback: match heading text to a known project name (case-insensitive)
         for card in section.get("cards", []):
             if card.get("type") == "heading":
                 heading_lc = card.get("heading", "").strip().lower()
-                if heading_lc in known_areas:
-                    section_area[i] = known_areas[heading_lc]
+                if heading_lc in known_projects:
+                    section_project[i] = known_projects[heading_lc]
                     break
+
+    # ── Pass 2.5: relocate cards sitting in an accidental placeholder section ─
+    # Self-heals cards added under the old area-grouping bug into a blank,
+    # untitled placeholder section instead of the one existing section that
+    # already represents their project. Deliberately narrow: only relocates
+    # cards out of a section whose heading is blank/missing. A section with
+    # any real heading text (e.g. a user manually split "Farm" out of
+    # "Winterthur") is never touched — manual dashboard organisation always
+    # wins over this heuristic, even when both sections map to the same
+    # underlying Tuya project.
+    sections = view.get("sections", [])
+    canonical_section: dict[str, int] = {}
+    for i in sorted(section_project):
+        canonical_section.setdefault(section_project[i], i)
+
+    section_heading: dict[int, str] = {}
+    for i, section in enumerate(sections):
+        heading_card = next((c for c in section.get("cards", []) if c.get("type") == "heading"), None)
+        section_heading[i] = (heading_card.get("heading", "") if heading_card else "").strip()
+
+    for i, section in enumerate(sections):
+        if section_heading.get(i, ""):
+            continue  # real heading — never auto-relocate cards out of it
+        cards = section.get("cards", [])
+        keep_cards = []
+        for card in cards:
+            if card.get("type") != "picture-glance":
+                keep_cards.append(card)
+                continue
+            norm = _normalize_cam_title(card.get("title", ""))
+            cam  = norm_map.get(norm)
+            target_idx = canonical_section.get(cam.get("project")) if cam else None
+            if target_idx is not None and target_idx != i:
+                sections[target_idx].setdefault("cards", []).append(card)
+                _LOGGER.info(
+                    "Lovelace: relocated card '%s' from blank section %d to canonical section %d (project=%s)",
+                    card.get("title"), i, target_idx, cam.get("project"),
+                )
+                changed = True
+                continue
+            keep_cards.append(card)
+        if len(keep_cards) != len(cards):
+            section["cards"] = keep_cards
+
+    # Drop now-empty placeholder sections (blank heading, no cameras left) —
+    # either pre-existing debris or created by this relocation pass.
+    kept_sections = []
+    for section in sections:
+        cards = section.get("cards", [])
+        has_camera = any(c.get("type") == "picture-glance" for c in cards)
+        only_blank_heading = (
+            len(cards) == 1 and cards[0].get("type") == "heading"
+            and not cards[0].get("heading", "").strip()
+        )
+        if not has_camera and only_blank_heading:
+            _LOGGER.info("Lovelace: removing empty placeholder section")
+            changed = True
+            continue
+        kept_sections.append(section)
+    if len(kept_sections) != len(sections):
+        view["sections"] = kept_sections
+        # Section indices shifted — rebuild section_project against the new
+        # list so Pass 3 below doesn't place cards using stale indices.
+        section_project = {}
+        for i, section in enumerate(kept_sections):
+            for card in section.get("cards", []):
+                if card.get("type") == "picture-glance":
+                    norm = _normalize_cam_title(card.get("title", ""))
+                    cam  = norm_map.get(norm)
+                    if cam and cam.get("project"):
+                        section_project[i] = cam["project"]
+                        break
 
     # ── Pass 3: add cards for missing cameras ─────────────────────────────
     for cam_key, cam in cam_info.items():
@@ -286,24 +431,31 @@ def _patch_cameras_view(view: dict, cam_info: dict) -> bool:
             )
             continue
 
-        area = cam.get("area", "")
-        # Find existing section for this area
+        project = cam.get("project", "")
+        # Find existing section for this project
         target_idx = next(
-            (i for i, a in section_area.items() if a == area),
+            (i for i, p in section_project.items() if p == project),
             None,
         )
         sections = view.setdefault("sections", [])
         if target_idx is None:
-            # Create a new section with an area heading
-            sections.append({"cards": [{"type": "heading", "heading": area}]})
+            # No section yet groups this project — create one, headed by the
+            # project name (only happens the first time a brand-new project's
+            # first camera is added; existing projects already have a section
+            # inferred via Pass 2 above, so their heading text is untouched).
+            sections.append({"cards": [{"type": "heading", "heading": project}]})
             target_idx = len(sections) - 1
-            section_area[target_idx] = area
+            section_project[target_idx] = project
 
         new_card = {
             "type": "picture-glance",
             "title": cam["name"],
             "camera_image": cam["camera_entity"],
-            "camera_view": "live",
+            # No "camera_view": "live" — that forces an immediate WebRTC/live
+            # stream per card. go2rtc never retires stale live producers
+            # (see 2026-08-10 finding), so simultaneous live cards pile up
+            # and starve each other, which is why some snapshots never load.
+            # Default view does lightweight periodic snapshot polling instead.
             "entities": [e for e in [
                 {"entity": cam["sd"]}     if cam["sd"]          else None,
                 {"entity": cam["online"]} if cam["online"]       else None,
@@ -313,10 +465,57 @@ def _patch_cameras_view(view: dict, cam_info: dict) -> bool:
         }
         sections[target_idx]["cards"].append(new_card)
         _LOGGER.info(
-            "Lovelace: added picture-glance card for new camera '%s' (area=%s, entity=%s)",
-            cam["name"], area, cam["camera_entity"],
+            "Lovelace: added picture-glance card for new camera '%s' (project=%s, entity=%s)",
+            cam["name"], project, cam["camera_entity"],
         )
         changed = True
+
+    # ── Pass 4: ⚡ warning card for any camera with no Area set ────────────
+    # Area drives motion-alert email routing (unrelated to the project-based
+    # grouping above) and is easy to forget on a freshly-added camera — the
+    # card links to the "Tuya Area Setup" docs view (_ensure_area_setup_view)
+    # so the fix is one tap away instead of buried in project memory.
+    _AREA_WARNING_KEY = "_tuya_cameras_area_warning_for"
+    for section in view.get("sections", []):
+        cards = section.get("cards", [])
+        new_cards = []
+        i = 0
+        while i < len(cards):
+            card = cards[i]
+            new_cards.append(card)
+            i += 1
+            if card.get("type") != "picture-glance":
+                continue
+            norm = _normalize_cam_title(card.get("title", ""))
+            cam  = norm_map.get(norm)
+            if not cam or not cam.get("dev_id"):
+                continue
+            # Is the next card already this camera's warning marker?
+            existing_warning = (
+                i < len(cards) and cards[i].get(_AREA_WARNING_KEY) == cam["dev_id"]
+            )
+            if cam.get("area_missing"):
+                if not existing_warning:
+                    new_cards.append({
+                        "type": "button",
+                        "icon": "mdi:lightning-bolt",
+                        "name": f"{cam['name']} — Area not set",
+                        "show_state": False,
+                        "tap_action": {"action": "navigate", "navigation_path": f"/lovelace/{_AREA_SETUP_VIEW_PATH}"},
+                        _AREA_WARNING_KEY: cam["dev_id"],
+                    })
+                    _LOGGER.info("Lovelace: added Area-missing warning icon for '%s'", cam["name"])
+                    changed = True
+                else:
+                    new_cards.append(cards[i])
+                    i += 1
+            elif existing_warning:
+                # Area was set since the last refresh — drop the stale warning card.
+                _LOGGER.info("Lovelace: removed Area-missing warning icon for '%s' (Area now set)", cam["name"])
+                i += 1
+                changed = True
+        if len(new_cards) != len(cards):
+            section["cards"] = new_cards
 
     return changed
 

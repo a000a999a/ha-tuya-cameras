@@ -24,6 +24,19 @@ full six-step setup guide starting from camera registration in SmartLife.
 
 ---
 
+## Tested hardware
+
+| Category | Tested devices |
+|---|---|
+| Fixed indoor camera | Smart Camera |
+| 360° panoramic camera | Panoramic / Panorama Bullet 2S |
+| Outdoor bullet camera | Bullet 2S |
+| Video doorbell | Intelligent Doorbell |
+
+Running across **16 cameras**, **3 separate Tuya developer projects / SmartLife accounts**, and **4 physical sites**. None of this is brand-specific — any Tuya-ecosystem IPC camera emitting the standard `movement_detect_pic` / `initiative_message` DPS events over the developer-platform MQTT broker should work, regardless of badge.
+
+> Cameras using Tuya's `v4.0 initiative_message` payload format (`keyId: "default"`) can't have their inline motion thumbnail decrypted — that key isn't exposed by any Tuya Open API, so it's a platform limitation rather than a per-camera bug. Those cameras still alert correctly via the RTSP snapshot fallback.
+
 ## Prerequisites
 
 - **[Tuya Home Core](https://github.com/a000a999a/ha-tuya-home-core)** installed and configured
