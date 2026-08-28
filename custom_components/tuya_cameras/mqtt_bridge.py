@@ -29,16 +29,36 @@ from .ai_client import AIClient
 from .ai_stats import AIStats
 from .camera_api import CameraAPI
 from .const import EVENT_AI_UPDATED
-from .notify import Notifier
+from .notify_helper import send_email
 
 _LOGGER = logging.getLogger(__name__)
 
 RECONNECT_BUFFER_S        = 600    # refresh creds 10 min before expiry
 RETRY_DELAY_S             = 30
-WATCHDOG_SILENCE_S        = 3600   # alert if client is DISCONNECTED + silent for 1 h
-WATCHDOG_SILENCE_CONN_S   = 28800  # alert if client is CONNECTED but silent for 8 h (cameras quiet)
-WATCHDOG_CHECK_S          = 300    # check every 5 min
+WATCHDOG_CHECK_S          = 300    # health check runs every 5 min (driven externally, see __init__.py)
+
+# Tier 2 — gentle forced-reconnect nudge while connected but quiet (fixes stale/IPv6 sessions).
+NUDGE_SILENCE_CONN_S      = 3600   # 1 h connected-but-silent → forced reconnect nudge
+
+# Tier 3 — full config-entry reload (2026-08-28: escalation added after Brasil's bridge task
+# silently died and never recovered on its own — a dead/hung task needs an outside actor to
+# notice and restart it; the in-loop retry in _run() can't save itself if the loop is gone).
+RELOAD_SILENCE_S          = 3600   # 1 h DISCONNECTED → reload (no nudge tier; a stuck in-loop
+                                    # retry for this long is already a strong "something's wrong" signal)
+RELOAD_SILENCE_CONN_S     = 7200   # 2 h CONNECTED-but-silent (i.e. the Tier-2 nudge didn't help) → reload
+RELOAD_COOLDOWN_S         = 6 * 3600   # don't auto-reload the same entry more than once per 6 h
+RELOAD_VERIFY_DELAY_S     = 900    # Tier 4: check 15 min after a reload whether messages resumed
+
 TECH_ALERT_COOLDOWN       = 1800   # suppress duplicate tech alerts for 30 min
+
+# Snapshot retry schedule (2026-08-28: front-loaded from the old (0, 1, 3) — a fast-moving
+# subject is most likely to still be in frame in the first ~1-2s after processing begins,
+# which is already ~1-2s after the physical event once MQTT delivery lag is accounted for.
+# Denser early sampling costs nothing extra (still 3 attempts, same AI-call count) but trades
+# off giving a genuinely cold RTSP stream slightly less time to stabilize between attempts.
+SNAPSHOT_RETRY_DELAYS_S   = (0, 0.5, 1.5)
+_HEALTH_DATA_KEY           = "tuya_cameras_health"  # hass.data key — survives entry reloads,
+                                    # unlike hass.data[DOMAIN][entry_id] which gets rebuilt
 
 
 class TuyaMQTTBridge:
@@ -49,7 +69,6 @@ class TuyaMQTTBridge:
         hass: Any,
         tuya_client: Any,
         camera_api: CameraAPI,
-        notifier: Notifier,
         recipients_cfg: dict,
         uid: str,
         access_id: str,
@@ -60,12 +79,13 @@ class TuyaMQTTBridge:
         alerts_enabled: bool = True,
         entry_label: str = "",
         animal_cfg: dict | None = None,
+        entry_id: str = "",
     ) -> None:
         self._hass           = hass
+        self._entry_id       = entry_id
         self._tuya_client    = tuya_client
         self._camera_api     = camera_api
-        self._notifier       = notifier
-        self._recipients_cfg = recipients_cfg  # {area: {human: "...", tech: "..."}}
+        self._recipients_cfg = recipients_cfg  # {area: {human: [entity_ids], tech: [entity_ids]}}
         self._uid            = uid
         self._access_id      = access_id
         self._core_coord     = core_coord      # coordinator for this project's device list only
@@ -76,7 +96,6 @@ class TuyaMQTTBridge:
         self._entry_label    = entry_label or uid  # used in tech alerts + motion email source tag
         self._animal_cfg     = animal_cfg or {}    # {device_id: {enabled, classes}}
         self._task: asyncio.Task | None = None
-        self._watchdog_task: asyncio.Task | None = None
         self._local_keys: dict[str, str] = {}    # device_id → local_key
         self._product_ids: dict[str, str] = {}  # device_id → product_id (for v4 blob decrypt)
         self._uuids: dict[str, str] = {}         # device_id → uuid
@@ -84,18 +103,16 @@ class TuyaMQTTBridge:
         self._last_tech_alert_at: float = 0.0
         self._current_client: Any = None  # live paho client; None when disconnected
         self._last_healed_at: float = 0.0  # last time watchdog forced a reconnect to heal silence
+        self._received_since_start: bool = False  # set True on first message this instance sees
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self, hass: Any) -> None:
-        self._task          = hass.async_create_background_task(self._run(),      "tuya_cameras_mqtt_bridge")
-        self._watchdog_task = hass.async_create_background_task(self._watchdog(), "tuya_cameras_mqtt_watchdog")
+        self._task = hass.async_create_background_task(self._run(), "tuya_cameras_mqtt_bridge")
 
     def stop(self) -> None:
         if self._task:
             self._task.cancel()
-        if self._watchdog_task:
-            self._watchdog_task.cancel()
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -318,6 +335,7 @@ class TuyaMQTTBridge:
 
     async def _handle(self, payload: bytes, key: bytes, full_password: str = "") -> None:
         self._last_msg_at = time.monotonic()  # watchdog heartbeat
+        self._received_since_start = True
         try:
             envelope = json.loads(payload)
         except Exception:
@@ -373,6 +391,20 @@ class TuyaMQTTBridge:
         )
         age_s  = (time.time() * 1000 - t_ms) / 1000
         ev_ts  = datetime.fromtimestamp(t_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        proc_start = time.monotonic()  # latency instrumentation — see _log_latency below
+
+        def _log_latency(outcome: str) -> None:
+            """Log total event-to-outcome latency: age_s (physical event → we started
+            processing, includes MQTT delivery lag) + our own processing/snapshot/AI time.
+            Added 2026-08-28 to make the "how many seconds to a snapshot" question and any
+            future timing-tuning (retry schedule, keep-warm, etc.) measurable instead of
+            inferred from scattered per-attempt lines.
+            """
+            proc_s = time.monotonic() - proc_start
+            _LOGGER.info(
+                "Motion %s/%s latency: event_age=%.1fs + processing=%.1fs = %.1fs total — outcome=%s",
+                area, name, age_s, proc_s, age_s + proc_s, outcome,
+            )
 
         _LOGGER.debug(
             "Motion %s/%s: code=%s bucket=%r files=%r",
@@ -417,7 +449,8 @@ class TuyaMQTTBridge:
             _LOGGER.debug("Motion %s/%s: no OSS image — trying HA snapshot(s)", area, name)
             cam_entity_id = await self._find_camera_entity_id(dev_id)
             snap_hashes: list[str] = []
-            for attempt, delay in enumerate((0, 1, 3)):
+            last_attempt = len(SNAPSHOT_RETRY_DELAYS_S) - 1
+            for attempt, delay in enumerate(SNAPSHOT_RETRY_DELAYS_S):
                 if delay:
                     await asyncio.sleep(delay)
                 snap = await self._get_ha_snapshot(dev_id, cam_entity_id)
@@ -428,7 +461,7 @@ class TuyaMQTTBridge:
                 snap_age  = age_s + delay
                 snap_note = f"live snapshot ({snap_age:.0f}s after event — person may have left)"
                 _LOGGER.debug(
-                    "Motion %s/%s: snapshot at +%ds ok (age %.0fs, size=%d bytes, entity=%s)",
+                    "Motion %s/%s: snapshot at +%.1fs ok (age %.1fs, size=%d bytes, entity=%s)",
                     area, name, delay, snap_age, len(snap), cam_entity_id or "None",
                 )
                 _dbg = (
@@ -453,11 +486,11 @@ class TuyaMQTTBridge:
                     img_bytes = snap
                     prefetched_ai = result
                     _LOGGER.debug(
-                        "Motion %s/%s: human found at +%ds (conf=%.2f)",
+                        "Motion %s/%s: human found at +%.1fs (conf=%.2f)",
                         area, name, delay, result["confidence"],
                     )
                     break
-                if delay == 3:
+                if attempt == last_attempt:
                     # All attempts exhausted — check for stale RTSP frame before discarding.
                     # Applies universally: Brasil v4.0, Brasil ?param=, Wallis, Camera Door —
                     # any camera that ends up in the snapshot path can hit this.
@@ -481,15 +514,16 @@ class TuyaMQTTBridge:
                             snap_note = "recovered snapshot after autonomous RTSP stream heal"
                             break   # exit snapshot loop → fall through to AI filtering + email
                     _LOGGER.debug(
-                        "Motion %s/%s: no human at +%ds (conf=%.2f) — all attempts exhausted",
+                        "Motion %s/%s: no human at +%.1fs (conf=%.2f) — all attempts exhausted",
                         area, name, delay, result["confidence"],
                     )
                     if self._ai_stats:
                         await self._ai_stats.async_record(human=False, area=area, camera=name)
                         self._hass.bus.async_fire(EVENT_AI_UPDATED)
+                    _log_latency("no_human_exhausted")
                     return
                 _LOGGER.debug(
-                    "Motion %s/%s: no human at +%ds (conf=%.2f) — retrying",
+                    "Motion %s/%s: no human at +%.1fs (conf=%.2f) — retrying",
                     area, name, delay, result["confidence"],
                 )
             else:
@@ -497,6 +531,7 @@ class TuyaMQTTBridge:
                     "Motion %s/%s: no image available (OSS failed + all snapshots failed) — event discarded",
                     area, name,
                 )
+                _log_latency("no_image")
                 return
 
         # ── AI filtering ──────────────────────────────────────────────────────
@@ -506,6 +541,7 @@ class TuyaMQTTBridge:
         if self._ai_client is not None:
             if not img_bytes:
                 _LOGGER.warning("Motion %s/%s: AI enabled but no image — event discarded", area, name)
+                _log_latency("no_image_ai_block")
                 return
 
             ai_result = prefetched_ai if prefetched_ai is not None else await self._ai_client.analyze(img_bytes)
@@ -525,6 +561,7 @@ class TuyaMQTTBridge:
                     if self._ai_stats:
                         await self._ai_stats.async_record(human=False, area=area, camera=name)
                         self._hass.bus.async_fire(EVENT_AI_UPDATED)
+                    _log_latency("no_human_or_animal")
                     return
 
                 if human_found:
@@ -573,11 +610,11 @@ class TuyaMQTTBridge:
         if to_addrs:
             if not self._alerts_enabled:
                 _LOGGER.debug("Motion %s/%s: MQTT alerts disabled — email suppressed", area, name)
+                _log_latency("suppressed_alerts_disabled")
             else:
-                await self._hass.async_add_executor_job(
-                    self._notifier.send, subject, body, to_addrs, email_image
-                )
+                await send_email(self._hass, subject, body, to_addrs, email_image)
                 _LOGGER.info("Motion alert sent for %s/%s to %s", area, name, to_addrs)
+                _log_latency("alerted")
         else:
             _LOGGER.warning(
                 "Motion %s/%s: detection fired but no recipients configured for area %r — "
@@ -585,6 +622,7 @@ class TuyaMQTTBridge:
                 "recipients config.",
                 area, name, area,
             )
+            _log_latency("no_recipients")
 
     def _check_animal(self, dev_id: str, ai_result: dict) -> str | None:
         """Return first matched animal class label if animal detection is enabled for this camera."""
@@ -688,20 +726,16 @@ class TuyaMQTTBridge:
             return None
 
     def _get_recipients(self, area: str, kind: str) -> list[str]:
-        import re
-        raw = self._recipients_cfg.get(area, {}).get(kind, "")
-        return [r.strip() for r in re.split(r"[;,]", raw) if r.strip()]
+        """Notify entity IDs configured for this area/kind (list already, from
+        the config flow's multi-select EntitySelector — no parsing needed)."""
+        return list(self._recipients_cfg.get(area, {}).get(kind, []))
 
     def _get_all_tech_recipients(self) -> list[str]:
-        import re
-        addrs: set[str] = set()
+        """Deduplicated notify entity IDs across every area's tech recipients."""
+        entities: set[str] = set()
         for area_cfg in self._recipients_cfg.values():
-            raw = area_cfg.get("tech", "")
-            for r in re.split(r"[;,]", raw):
-                r = r.strip()
-                if r:
-                    addrs.add(r)
-        return list(addrs)
+            entities.update(area_cfg.get("tech", []))
+        return list(entities)
 
     async def _send_tech_alert(self, subject: str, detail: str) -> None:
         """Send a tech alert email — rate-limited to once per 30 min."""
@@ -721,9 +755,7 @@ class TuyaMQTTBridge:
             f"<p style='color:#888;font-size:0.9em;'>Home Assistant / tuya_cameras</p>"
             f"</body></html>"
         )
-        await self._hass.async_add_executor_job(
-            self._notifier.send, f"[HA Cameras] {subject}", body, to, None
-        )
+        await send_email(self._hass, f"[HA Cameras] {subject}", body, to)
         _LOGGER.info("Tech alert sent: %s → %s", subject, to)
 
     def _get_camera_states(self) -> dict[str, str]:
@@ -743,81 +775,127 @@ class TuyaMQTTBridge:
             pass
         return result
 
-    async def _watchdog(self) -> None:
-        """Send a tech alert if MQTT goes silent beyond the expected threshold.
+    def _health_state(self) -> dict:
+        """Cross-reload persistent health marker for this entry.
 
-        Two thresholds:
-        - Disconnected (client is None or not connected): alert after 1 h silence.
-          A healthy bridge reconnects within seconds; 1 h means reconnection is stuck.
-        - Connected but silent: alert after 8 h silence.
-          Cameras in quiet locations (Wallis farm, overnight) can go hours without
-          a motion event — that is normal and should not produce alerts.
+        Deliberately stored outside hass.data[DOMAIN][entry_id] — a config-entry reload
+        tears that down and rebuilds it fresh, but Tier 4 needs to remember "we just
+        auto-reloaded this entry" across exactly that boundary to verify recovery.
         """
-        while True:
-            try:
-                await asyncio.sleep(WATCHDOG_CHECK_S)
-                silence = time.monotonic() - self._last_msg_at
-                connected = bool(
-                    self._current_client and self._current_client.is_connected()
+        return self._hass.data.setdefault(_HEALTH_DATA_KEY, {}).setdefault(
+            self._entry_id, {"last_reload_at": 0.0, "pending_verification": False},
+        )
+
+    async def check_health(self) -> None:
+        """Check bridge health and self-heal if needed. Called every WATCHDOG_CHECK_S by
+        an external homeassistant.helpers.event.async_track_time_interval callback (see
+        __init__.py) — NOT a self-managed background task. That's deliberate: 2026-08-28,
+        a bridge's own _run() task silently died and its (then-internal) watchdog task
+        went quiet with it, so nothing noticed for ~8 hours. An externally-scheduled check
+        keeps running even if this bridge's own tasks hang or die, since it doesn't depend
+        on them to be invoked.
+
+        Escalation:
+        - Tier 1 (in _run()): normal disconnect → reconnect within seconds. No alert.
+        - Tier 2: connected but silent > 1 h → forced reconnect nudge (stale/IPv6 session).
+        - Tier 3: disconnected > 1 h, OR connected-but-silent > 2 h, OR the _run() task has
+          died outright → full config-entry reload. Alerts once before reloading.
+        - Tier 4: ~15 min after a Tier-3 reload, verify messages resumed. Silent if fixed;
+          alerts once if not.
+        """
+        health = self._health_state()
+
+        # Tier 4 — verify a previous auto-reload actually fixed things.
+        if health["pending_verification"]:
+            since_reload = time.monotonic() - health["last_reload_at"]
+            if since_reload < RELOAD_VERIFY_DELAY_S:
+                return  # still inside the grace window, nothing to do yet
+            health["pending_verification"] = False
+            if not self._received_since_start:
+                await self._send_tech_alert(
+                    f"MQTT bridge still broken — {self._entry_label} — automatic recovery failed",
+                    f"An automatic reload was triggered {since_reload / 60:.0f} minutes ago after "
+                    f"prolonged MQTT silence, but no motion events have been received since. "
+                    f"Automatic recovery did not fix this — needs manual attention.",
                 )
-                threshold = WATCHDOG_SILENCE_CONN_S if connected else WATCHDOG_SILENCE_S
-                if silence > threshold:
-                    # Check whether cameras in this bridge are offline (intentionally disabled).
-                    # If all known cameras are unavailable, silence is explained — skip heal.
-                    cam_states = self._get_camera_states()
-                    all_offline = bool(cam_states) and all(
-                        s in ("unavailable", "idle", "off") for s in cam_states.values()
-                    )
-                    if all_offline:
-                        _LOGGER.debug(
-                            "Watchdog %s: silence %.0f min but all cameras offline — suppressing",
-                            self._entry_label, silence / 60,
-                        )
-                        await self._send_tech_alert(
-                            f"MQTT bridge silent — {self._entry_label} — cameras offline",
-                            f"No MQTT messages for {silence / 60:.0f} minutes, but all cameras "
-                            f"for this bridge appear offline or unavailable in HA "
-                            f"({', '.join(f'{k}={v}' for k, v in cam_states.items())}). "
-                            f"Silence is expected. Re-enable cameras to resume motion alerts.",
-                        )
-                    else:
-                        heal_eligible = (
-                            connected
-                            and (time.monotonic() - self._last_healed_at) > threshold
-                        )
-                        if heal_eligible:
-                            # Force a reconnect: disconnecting the live client triggers on_disconnect
-                            # → disconnect_event.set() → _run() reconnects with fresh AF_INET creds.
-                            # Fixes IPv6-stale sessions; harmless if silence is genuine.
-                            client_to_drop = self._current_client
-                            self._current_client = None
-                            self._last_healed_at = time.monotonic()
-                            self._last_msg_at    = time.monotonic()  # reset window from heal time
-                            await self._hass.async_add_executor_job(self._disconnect, client_to_drop)
-                            _LOGGER.info(
-                                "Watchdog heal: forced reconnect for %s after %.0f min silence",
-                                self._entry_label, silence / 60,
-                            )
-                            await self._send_tech_alert(
-                                f"MQTT bridge silent — {self._entry_label} — reconnecting",
-                                f"No MQTT messages for {silence / 60:.0f} minutes (connected but silent). "
-                                f"Forcing reconnect to heal potential stale session (e.g. IPv6 stuck). "
-                                f"If events resume, the session was stale. If still silent after 8 h, "
-                                f"cameras in this area may genuinely have no motion.",
-                            )
-                        else:
-                            state = "connected but silent" if connected else "disconnected"
-                            await self._send_tech_alert(
-                                f"MQTT bridge silent — {self._entry_label}",
-                                f"No MQTT messages received for {silence / 60:.0f} minutes "
-                                f"(bridge is {state}). "
-                                f"A reconnect was already attempted. If no events arrive, this area "
-                                f"may be genuinely quiet or the broker has a persistent issue.",
-                            )
-            except asyncio.CancelledError:
+            return  # either way, skip the normal checks this cycle
+
+        task_dead = self._task is not None and self._task.done()
+        silence   = time.monotonic() - self._last_msg_at
+        connected = bool(self._current_client and self._current_client.is_connected())
+
+        if not task_dead and silence <= NUDGE_SILENCE_CONN_S:
+            return  # healthy
+
+        # Cameras genuinely offline (e.g. router down)? Silence is explained — don't heal/reload.
+        cam_states = self._get_camera_states()
+        all_offline = bool(cam_states) and all(
+            s in ("unavailable", "idle", "off") for s in cam_states.values()
+        )
+        if all_offline:
+            _LOGGER.debug(
+                "Health check %s: silence %.0f min but all cameras offline — suppressing",
+                self._entry_label, silence / 60,
+            )
+            await self._send_tech_alert(
+                f"MQTT bridge silent — {self._entry_label} — cameras offline",
+                f"No MQTT messages for {silence / 60:.0f} minutes, but all cameras "
+                f"for this bridge appear offline or unavailable in HA "
+                f"({', '.join(f'{k}={v}' for k, v in cam_states.items())}). "
+                f"Silence is expected. Re-enable cameras to resume motion alerts.",
+            )
+            return
+
+        reload_threshold = RELOAD_SILENCE_S if not connected else RELOAD_SILENCE_CONN_S
+        if task_dead or silence > reload_threshold:
+            if time.monotonic() - health["last_reload_at"] < RELOAD_COOLDOWN_S:
+                await self._send_tech_alert(
+                    f"MQTT bridge still silent — {self._entry_label} — auto-recovery on cooldown",
+                    f"Bridge has been silent for {silence / 60:.0f} minutes"
+                    + (" and its background task has stopped" if task_dead else "")
+                    + f". An automatic reload was already attempted recently and is on a "
+                      f"{RELOAD_COOLDOWN_S / 3600:.0f}h cooldown to avoid repeated reload loops. "
+                      f"This needs manual attention if it persists.",
+                )
                 return
-            except Exception as err:
-                _LOGGER.debug("Watchdog loop error: %s", err)
+            await self._send_tech_alert(
+                f"MQTT bridge silent — {self._entry_label} — attempting automatic recovery",
+                f"No MQTT messages for {silence / 60:.0f} minutes"
+                + (" and the bridge's background task stopped unexpectedly" if task_dead else "")
+                + f". Reloading the integration automatically to recover. "
+                  f"You'll only hear from this again if the reload doesn't fix it.",
+            )
+            health["last_reload_at"]        = time.monotonic()
+            health["pending_verification"]  = True
+            _LOGGER.warning(
+                "Health check: reloading %s after %.0f min silence (task_dead=%s)",
+                self._entry_label, silence / 60, task_dead,
+            )
+            self._hass.async_create_task(self._hass.config_entries.async_reload(self._entry_id))
+            return
+
+        # Connected but silent, below the reload threshold — Tier 2 gentle nudge.
+        heal_eligible = connected and (time.monotonic() - self._last_healed_at) > NUDGE_SILENCE_CONN_S
+        if heal_eligible:
+            # Force a reconnect: disconnecting the live client triggers on_disconnect
+            # → disconnect_event.set() → _run() reconnects with fresh AF_INET creds.
+            # Fixes IPv6-stale sessions; harmless if silence is genuine.
+            client_to_drop = self._current_client
+            self._current_client = None
+            self._last_healed_at = time.monotonic()
+            self._last_msg_at    = time.monotonic()  # reset window from heal time
+            await self._hass.async_add_executor_job(self._disconnect, client_to_drop)
+            _LOGGER.info(
+                "Health check heal: forced reconnect for %s after %.0f min silence",
+                self._entry_label, silence / 60,
+            )
+            await self._send_tech_alert(
+                f"MQTT bridge silent — {self._entry_label} — reconnecting",
+                f"No MQTT messages for {silence / 60:.0f} minutes (connected but silent). "
+                f"Forcing reconnect to heal potential stale session (e.g. IPv6 stuck). "
+                f"If events resume, the session was stale. If still silent after "
+                f"{RELOAD_SILENCE_CONN_S / 3600:.0f} h total, this will reload automatically.",
+            )
 
     @staticmethod
     def _decrypt(data: Any, key: bytes) -> dict:

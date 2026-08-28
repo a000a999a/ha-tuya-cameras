@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from datetime import datetime, timezone
 from typing import Any
 
 from .const import DOMAIN, WEBHOOK_ID
+from .notify_helper import send_email
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -92,7 +92,6 @@ class SmartLifeWebhookBridge:
         _LOGGER.debug("SmartLife webhook: matched area=%r camera=%r", area, cam_name)
 
         bridge   = entry_data.get("bridge")    if entry_data else None
-        notifier = entry_data.get("notifier")  if entry_data else self._first_notifier()
         ai_stats = entry_data.get("ai_stats")  if entry_data else None
 
         ai_client  = bridge._ai_client if bridge else self._first_ai_client()
@@ -213,12 +212,6 @@ class SmartLifeWebhookBridge:
             )
             return
 
-        if not notifier:
-            _LOGGER.warning(
-                "SmartLife webhook %s/%s: no notifier available — skipping email", area, cam_name
-            )
-            return
-
         ev_ts   = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         if detected_label:
             subject = f"{detected_label.capitalize()} detected — {area} / {cam_name} [SmartLife]"
@@ -239,7 +232,7 @@ class SmartLifeWebhookBridge:
             f"</body></html>"
         )
 
-        await self._hass.async_add_executor_job(notifier.send, subject, body, recipients, img_bytes)
+        await send_email(self._hass, subject, body, recipients, img_bytes)
         _LOGGER.info(
             "SmartLife webhook alert sent for %s/%s to %s", area, cam_name, recipients
         )
@@ -311,21 +304,11 @@ class SmartLifeWebhookBridge:
                 return b._ai_client
         return None
 
-    def _first_notifier(self) -> Any | None:
-        for d in self._all_entry_data():
-            n = d.get("notifier")
-            if n:
-                return n
-        return None
-
     def _all_human_recipients(self) -> list[str]:
         addrs: set[str] = set()
         for d in self._all_entry_data():
             b = d.get("bridge")
             if b:
                 for area_cfg in b._recipients_cfg.values():
-                    for r in re.split(r"[;,]", area_cfg.get("human", "")):
-                        r = r.strip()
-                        if r:
-                            addrs.add(r)
+                    addrs.update(area_cfg.get("human", []))
         return list(addrs)

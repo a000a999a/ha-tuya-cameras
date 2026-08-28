@@ -5,19 +5,9 @@
         "title": "Select Tuya Account",
         "data": { "core_entry_id": "Tuya Home Core account" }
       },
-      "smtp": {
-        "title": "Email / SMTP Settings",
-        "description": "Alerts are sent via this SMTP account. Gmail: use an App Password, not your login password.",
-        "data": {
-          "smtp_host":     "SMTP host",
-          "smtp_port":     "SMTP port",
-          "smtp_sender":   "Sender email address",
-          "smtp_password": "SMTP password / App Password"
-        }
-      },
       "area_recipients": {
         "title": "Recipients — {area}",
-        "description": "Separate multiple addresses with semicolons. Leave blank to disable alerts for this area.",
+        "description": "Select the notify entities (Settings → Devices & Services → SMTP) that should receive alerts for this area. Leave blank to disable alerts for this area.",
         "data": {
           "human": "Human alert recipients (motion detected)",
           "tech":  "Tech alert recipients (SD card, camera offline)"
@@ -34,7 +24,6 @@
       "init": {
         "title": "Camera Settings",
         "menu_options": {
-          "edit_smtp":       "Update SMTP / email settings",
           "edit_recipients": "Edit area recipients",
           "edit_settings":   "Refresh interval & SD alert threshold",
           "edit_ai":         "AI human detection",
@@ -50,22 +39,13 @@
           "sd_alert_threshold": "SD card alert threshold (%)"
         }
       },
-      "edit_smtp": {
-        "title": "SMTP Settings",
-        "data": {
-          "smtp_host":     "SMTP host",
-          "smtp_port":     "SMTP port",
-          "smtp_sender":   "Sender email address",
-          "smtp_password": "SMTP password / App Password"
-        }
-      },
       "edit_recipients": {
         "title": "Select Area",
         "data": { "area": "Area to configure" }
       },
       "edit_area": {
         "title": "Recipients — {area}",
-        "description": "Separate multiple addresses with semicolons.",
+        "description": "Select the notify entities (Settings → Devices & Services → SMTP) that should receive alerts for this area.",
         "data": {
           "human": "Human alert recipients",
           "tech":  "Tech alert recipients"

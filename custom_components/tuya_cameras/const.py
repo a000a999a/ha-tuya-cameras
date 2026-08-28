@@ -5,11 +5,9 @@ DOMAIN_CORE = "tuya_home_core"
 
 # Config / data keys
 CONF_CORE_ENTRY_ID   = "core_entry_id"
-CONF_SMTP_HOST       = "smtp_host"
-CONF_SMTP_PORT       = "smtp_port"
-CONF_SMTP_SENDER     = "smtp_sender"
-CONF_SMTP_PASSWORD   = "smtp_password"
 CONF_RECIPIENTS      = "recipients"   # stored in options
+# Each value is a list of `notify.*` entity IDs (from HA's SMTP integration),
+# not raw email strings — see notify_helper.py.
 CONF_HUMAN_RECIPIENTS = "human"
 CONF_TECH_RECIPIENTS  = "tech"
 
@@ -37,10 +35,6 @@ DEFAULT_SD_ALERT_THRESHOLD = 90  # percent — alert when SD usage exceeds this
 # Coordinator refresh
 CONF_REFRESH_DAYS    = "refresh_days"
 DEFAULT_REFRESH_DAYS = 14
-
-# SMTP defaults
-DEFAULT_SMTP_HOST = "smtp.gmail.com"
-DEFAULT_SMTP_PORT = 587
 
 # AI detection
 CONF_AI_ENABLED = "ai_detection_enabled"

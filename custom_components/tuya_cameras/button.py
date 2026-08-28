@@ -18,7 +18,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .camera_api import CameraAPI
 from .const import CONF_RECIPIENTS, CONF_TECH_RECIPIENTS, DOMAIN
 from .coordinator import CameraCoordinator
-from .notify import Notifier
+from .notify_helper import send_email
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,12 +32,11 @@ async def async_setup_entry(
     coordinator = data["coordinator"]
     core_coord  = data["core_coord"]
     camera_api  = data["camera_api"]
-    notifier    = data["notifier"]
     cameras     = (coordinator.data or {}).get("cameras", {})
 
     entities: list[ButtonEntity] = [
         RefreshButton(entry, core_coord, coordinator),
-        TestMailerButton(entry, notifier),
+        TestMailerButton(entry),
         *[
             FormatSDButton(entry, dev_id, cam, camera_api)
             for dev_id, cam in cameras.items()
@@ -88,9 +87,8 @@ class TestMailerButton(ButtonEntity):
     _attr_icon             = "mdi:email-check"
     _attr_entity_category  = EntityCategory.DIAGNOSTIC
 
-    def __init__(self, entry: ConfigEntry, notifier: Notifier) -> None:
+    def __init__(self, entry: ConfigEntry) -> None:
         self._entry    = entry
-        self._notifier = notifier
         self._attr_unique_id = f"{entry.entry_id}_test_mailer"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)},
@@ -104,11 +102,7 @@ class TestMailerButton(ButtonEntity):
         recipients = self._entry.options.get(CONF_RECIPIENTS, {})
 
         for area, addr_map in recipients.items():
-            tech_addrs = [
-                a.strip()
-                for a in addr_map.get(CONF_TECH_RECIPIENTS, "").split(",")
-                if a.strip()
-            ]
+            tech_addrs = addr_map.get(CONF_TECH_RECIPIENTS, [])
             if not tech_addrs:
                 _LOGGER.warning("Test mailer: no tech recipients for area %s", area)
                 continue
@@ -121,9 +115,7 @@ class TestMailerButton(ButtonEntity):
                 f"<p>SMTP is working correctly for area <b>{area}</b>.</p>"
                 "</body></html>"
             )
-            await self.hass.async_add_executor_job(
-                self._notifier.send, subject, body, tech_addrs
-            )
+            await send_email(self.hass, subject, body, tech_addrs)
             _LOGGER.info("Test email sent to %s for area %s", tech_addrs, area)
 
 

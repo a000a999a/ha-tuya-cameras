@@ -23,59 +23,38 @@ from .const import (
     CONF_RECIPIENTS,
     CONF_REFRESH_DAYS,
     CONF_SD_ALERT_THRESHOLD,
-    CONF_SMTP_HOST,
-    CONF_SMTP_PASSWORD,
-    CONF_SMTP_PORT,
-    CONF_SMTP_SENDER,
     CONF_TECH_RECIPIENTS,
     DEFAULT_AI_URL,
     DEFAULT_REFRESH_DAYS,
     DEFAULT_SD_ALERT_THRESHOLD,
-    DEFAULT_SMTP_HOST,
-    DEFAULT_SMTP_PORT,
     DOMAIN,
     DOMAIN_CORE,
 )
 
 
-def _smtp_schema(defaults: dict | None = None) -> vol.Schema:
-    d = defaults or {}
-    return vol.Schema({
-        vol.Required(CONF_SMTP_HOST,     default=d.get(CONF_SMTP_HOST, DEFAULT_SMTP_HOST)): str,
-        vol.Required(CONF_SMTP_PORT,     default=d.get(CONF_SMTP_PORT, DEFAULT_SMTP_PORT)):
-            selector.NumberSelector(selector.NumberSelectorConfig(
-                min=1, max=65535, mode=selector.NumberSelectorMode.BOX
-            )),
-        vol.Required(CONF_SMTP_SENDER,   default=d.get(CONF_SMTP_SENDER, "")): str,
-        vol.Required(CONF_SMTP_PASSWORD, default=d.get(CONF_SMTP_PASSWORD, "")):
-            selector.TextSelector(selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)),
-    })
-
-
+# Notify-target selectors, scoped to the SMTP integration specifically — the
+# email send path uses smtp.send_message (for HTML + inline-image support),
+# which only accepts SMTP-backed notify entities as its target. `multiple`
+# preserves the old comma/semicolon-separated multi-recipient-per-field
+# behaviour, just as a proper multi-select instead of a parsed string.
 def _area_schema(area: str, defaults: dict | None = None) -> vol.Schema:
     d = defaults or {}
+    notify_selector = selector.EntitySelector(
+        selector.EntitySelectorConfig(domain="notify", integration="smtp", multiple=True)
+    )
     return vol.Schema({
-        vol.Optional(CONF_HUMAN_RECIPIENTS, default=d.get(CONF_HUMAN_RECIPIENTS, "")):
-            selector.TextSelector(selector.TextSelectorConfig(
-                multiline=False,
-                type=selector.TextSelectorType.EMAIL,
-            )),
-        vol.Optional(CONF_TECH_RECIPIENTS, default=d.get(CONF_TECH_RECIPIENTS, "")):
-            selector.TextSelector(selector.TextSelectorConfig(
-                multiline=False,
-                type=selector.TextSelectorType.EMAIL,
-            )),
+        vol.Optional(CONF_HUMAN_RECIPIENTS, default=d.get(CONF_HUMAN_RECIPIENTS, [])): notify_selector,
+        vol.Optional(CONF_TECH_RECIPIENTS,  default=d.get(CONF_TECH_RECIPIENTS, [])):  notify_selector,
     })
 
 
 class TuyaCamerasConfigFlow(ConfigFlow, domain=DOMAIN):
-    """Three-phase flow: pick core → SMTP → per-area recipients."""
+    """Two-phase flow: pick core → per-area recipients."""
 
     VERSION = 1
 
     def __init__(self) -> None:
         self._core_entry_id = ""
-        self._smtp_data: dict = {}
         self._areas: list[str] = []
         self._recipients: dict = {}
         self._area_index = 0
@@ -98,11 +77,11 @@ class TuyaCamerasConfigFlow(ConfigFlow, domain=DOMAIN):
 
         if len(core_entries) == 1:
             self._core_entry_id = core_entries[0].entry_id
-            return await self.async_step_smtp()
+            return await self._load_areas_and_next()
 
         if user_input is not None:
             self._core_entry_id = user_input[CONF_CORE_ENTRY_ID]
-            return await self.async_step_smtp()
+            return await self._load_areas_and_next()
 
         schema = vol.Schema({
             vol.Required(CONF_CORE_ENTRY_ID): selector.SelectSelector(
@@ -113,19 +92,6 @@ class TuyaCamerasConfigFlow(ConfigFlow, domain=DOMAIN):
             )
         })
         return self.async_show_form(step_id="user", data_schema=schema)
-
-    async def async_step_smtp(self, user_input: dict | None = None) -> ConfigFlowResult:
-        errors: dict[str, str] = {}
-        if user_input is not None:
-            self._smtp_data = {
-                **user_input,
-                CONF_SMTP_PORT: int(user_input[CONF_SMTP_PORT]),
-            }
-            return await self._load_areas_and_next()
-
-        return self.async_show_form(
-            step_id="smtp", data_schema=_smtp_schema(), errors=errors
-        )
 
     async def _load_areas_and_next(self) -> ConfigFlowResult:
         core = self.hass.data.get(DOMAIN_CORE, {}).get(self._core_entry_id, {})
@@ -142,8 +108,8 @@ class TuyaCamerasConfigFlow(ConfigFlow, domain=DOMAIN):
         area = self._areas[self._area_index]
         if user_input is not None:
             self._recipients[area] = {
-                CONF_HUMAN_RECIPIENTS: user_input.get(CONF_HUMAN_RECIPIENTS, ""),
-                CONF_TECH_RECIPIENTS:  user_input.get(CONF_TECH_RECIPIENTS, ""),
+                CONF_HUMAN_RECIPIENTS: user_input.get(CONF_HUMAN_RECIPIENTS, []),
+                CONF_TECH_RECIPIENTS:  user_input.get(CONF_TECH_RECIPIENTS, []),
             }
             self._area_index += 1
             if self._area_index < len(self._areas):
@@ -161,10 +127,7 @@ class TuyaCamerasConfigFlow(ConfigFlow, domain=DOMAIN):
         title = core_entry.title if core_entry else "Tuya Cameras"
         return self.async_create_entry(
             title=title,
-            data={
-                CONF_CORE_ENTRY_ID: self._core_entry_id,
-                **self._smtp_data,
-            },
+            data={CONF_CORE_ENTRY_ID: self._core_entry_id},
             options={CONF_RECIPIENTS: self._recipients},
         )
 
@@ -175,7 +138,7 @@ class TuyaCamerasConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class TuyaCamerasOptionsFlow(OptionsFlow):
-    """Options: update SMTP or edit per-area recipients."""
+    """Options: edit per-area recipients and other settings."""
 
     def __init__(self, config_entry: ConfigEntry) -> None:
         self._entry               = config_entry
@@ -187,7 +150,7 @@ class TuyaCamerasOptionsFlow(OptionsFlow):
     async def async_step_init(self, user_input: dict | None = None) -> ConfigFlowResult:
         return self.async_show_menu(
             step_id="init",
-            menu_options=["edit_smtp", "edit_recipients", "edit_settings", "edit_ai", "edit_alerts", "edit_animal"],
+            menu_options=["edit_recipients", "edit_settings", "edit_ai", "edit_alerts", "edit_animal"],
         )
 
     async def async_step_edit_settings(self, user_input: dict | None = None) -> ConfigFlowResult:
@@ -218,19 +181,6 @@ class TuyaCamerasOptionsFlow(OptionsFlow):
         })
         return self.async_show_form(step_id="edit_settings", data_schema=schema)
 
-    async def async_step_edit_smtp(self, user_input: dict | None = None) -> ConfigFlowResult:
-        if user_input is not None:
-            new_data = {**self._entry.data, **user_input, CONF_SMTP_PORT: int(user_input[CONF_SMTP_PORT])}
-            self.hass.config_entries.async_update_entry(self._entry, data=new_data)
-            return self.async_create_entry(data={**self._entry.options, CONF_RECIPIENTS: self._recipients})
-
-        defaults = {k: self._entry.data.get(k) for k in (
-            CONF_SMTP_HOST, CONF_SMTP_PORT, CONF_SMTP_SENDER, CONF_SMTP_PASSWORD
-        )}
-        return self.async_show_form(
-            step_id="edit_smtp", data_schema=_smtp_schema(defaults)
-        )
-
     async def async_step_edit_recipients(self, user_input: dict | None = None) -> ConfigFlowResult:
         areas = list(self._recipients.keys())
         cam_data = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
@@ -239,7 +189,7 @@ class TuyaCamerasOptionsFlow(OptionsFlow):
             live_areas = sorted({cam["area"] for cam in coord.data.get("cameras", {}).values() if cam.get("area")})
             for a in live_areas:
                 if a not in self._recipients:
-                    self._recipients[a] = {CONF_HUMAN_RECIPIENTS: "", CONF_TECH_RECIPIENTS: ""}
+                    self._recipients[a] = {CONF_HUMAN_RECIPIENTS: [], CONF_TECH_RECIPIENTS: []}
             areas = live_areas or areas
 
         if not areas:
@@ -260,8 +210,8 @@ class TuyaCamerasOptionsFlow(OptionsFlow):
         area = self._selected_area
         if user_input is not None:
             self._recipients[area] = {
-                CONF_HUMAN_RECIPIENTS: user_input.get(CONF_HUMAN_RECIPIENTS, ""),
-                CONF_TECH_RECIPIENTS:  user_input.get(CONF_TECH_RECIPIENTS, ""),
+                CONF_HUMAN_RECIPIENTS: user_input.get(CONF_HUMAN_RECIPIENTS, []),
+                CONF_TECH_RECIPIENTS:  user_input.get(CONF_TECH_RECIPIENTS, []),
             }
             return self.async_create_entry(data={**self._entry.options, CONF_RECIPIENTS: self._recipients})
 

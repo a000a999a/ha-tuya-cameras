@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.event import async_track_time_interval
 
 from .ai_client import AIClient
 from .ai_stats import AIStats
@@ -19,12 +21,10 @@ from .const import (
     CONF_CAMERA_ANIMAL_CONFIG,
     CONF_CORE_ENTRY_ID, CONF_RECIPIENTS, CONF_REFRESH_DAYS, DEFAULT_REFRESH_DAYS,
     CONF_MQTT_ALERTS_ENABLED, CONF_WEBHOOK_ALERTS_ENABLED,
-    CONF_SMTP_HOST, CONF_SMTP_PASSWORD, CONF_SMTP_PORT, CONF_SMTP_SENDER,
     DOMAIN, DOMAIN_CORE,
 )
 from .coordinator import CameraCoordinator
-from .mqtt_bridge import TuyaMQTTBridge
-from .notify import Notifier
+from .mqtt_bridge import WATCHDOG_CHECK_S, TuyaMQTTBridge
 from .webhook_bridge import SmartLifeWebhookBridge
 
 _LOGGER = logging.getLogger(__name__)
@@ -659,13 +659,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     tuya_client = core["api"].client
     core_coord  = core["coordinator"]
 
-    smtp_config = {
-        CONF_SMTP_HOST:     entry.data[CONF_SMTP_HOST],
-        CONF_SMTP_PORT:     entry.data[CONF_SMTP_PORT],
-        CONF_SMTP_SENDER:   entry.data[CONF_SMTP_SENDER],
-        CONF_SMTP_PASSWORD: entry.data[CONF_SMTP_PASSWORD],
-    }
-    notifier     = Notifier(smtp_config)
     camera_api   = CameraAPI(tuya_client)
     refresh_days = entry.options.get(CONF_REFRESH_DAYS, DEFAULT_REFRESH_DAYS)
     coordinator  = CameraCoordinator(hass, camera_api, core_coord, refresh_days)
@@ -682,9 +675,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         @callback
         def _post_start_refresh(_event=None):
             hass.async_create_task(coordinator.async_refresh())
-        entry.async_on_unload(
-            hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _post_start_refresh)
-        )
+
+        unsub = hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _post_start_refresh)
+
+        def _safe_unsub() -> None:
+            # listen_once already self-removes once it fires; a reload after that
+            # point calls this stored unsub a second time and would otherwise raise.
+            try:
+                unsub()
+            except ValueError:
+                pass
+
+        entry.async_on_unload(_safe_unsub)
 
     recipients = entry.options.get(CONF_RECIPIENTS, {})
     uid        = core.get("uid", "")
@@ -713,7 +715,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass           = hass,
         tuya_client    = tuya_client,
         camera_api     = camera_api,
-        notifier       = notifier,
         recipients_cfg = recipients,
         uid            = uid,
         access_id      = access_id,
@@ -724,6 +725,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         alerts_enabled = mqtt_enabled,
         entry_label    = entry.title,
         animal_cfg     = animal_cfg,
+        entry_id       = entry.entry_id,
     )
 
     domain_data = hass.data.setdefault(DOMAIN, {})
@@ -731,7 +733,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "coordinator":            coordinator,
         "core_coord":             core_coord,
         "camera_api":             camera_api,
-        "notifier":               notifier,
         "bridge":                 bridge,
         "ai_stats":               ai_stats,
         "webhook_alerts_enabled": webhook_enabled,
@@ -768,6 +769,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await _cleanup_stale_entities()
 
     bridge.start(hass)
+
+    # Health check runs on HA's own core timer, not a bridge-managed task — deliberately
+    # external so it keeps checking even if the bridge's own background task hangs or dies
+    # (see check_health()'s docstring for why: this is exactly what happened to Brasil's
+    # bridge on 2026-08-27, and nothing noticed for ~8 hours).
+    #
+    # Must be @callback: an undecorated function here gets dispatched via HA's executor
+    # thread pool (it can't statically prove a plain function is loop-safe), and
+    # hass.async_create_task() requires the event loop thread — calling it from the
+    # executor thread raises RuntimeError on every single tick. Confirmed live 2026-08-28:
+    # this fired continuously (every WATCHDOG_CHECK_S, x3 entries) from the moment v0.9.0
+    # deployed until this fix landed.
+    @callback
+    def _schedule_health_check(_now) -> None:
+        hass.async_create_task(bridge.check_health())
+
+    entry.async_on_unload(
+        async_track_time_interval(
+            hass, _schedule_health_check, timedelta(seconds=WATCHDOG_CHECK_S),
+        )
+    )
+
     hass.async_create_task(_update_lovelace_views(hass))
     _LOGGER.info(
         "Tuya Cameras loaded: %d camera(s), refresh every %d day(s)",
