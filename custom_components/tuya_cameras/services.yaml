@@ -10,6 +10,44 @@ refresh_status:
   name: Refresh Camera Status
   description: Re-fetches SD card and online status for all cameras immediately.
 
+handle_onvif_motion:
+  name: Handle ONVIF Motion Event
+  description: >
+    Runs the snapshot -> AI -> email pipeline for a motion event from a camera
+    that's connected via HA's native ONVIF integration instead of the Tuya
+    MQTT/cloud path (e.g. a device whose Tuya cloud data is broken). Intended
+    to be called from an automation triggered by an ONVIF motion binary_sensor
+    turning on.
+  fields:
+    entry_id:
+      name: Tuya Cameras entry ID
+      description: The tuya_cameras config entry whose area recipients/AI settings to use.
+      required: true
+      example: "01M1297TVX428YXEFBP4PR0P6S"
+      selector:
+        text: {}
+    area:
+      name: Area
+      description: Area name, matching this entry's configured recipients (e.g. "Winterthur").
+      required: true
+      example: "Winterthur"
+      selector:
+        text: {}
+    name:
+      name: Camera name
+      description: Display name for this camera, used in the email subject/body.
+      required: true
+      example: "Winti Terrasse"
+      selector:
+        text: {}
+    camera_entity_id:
+      name: Camera entity
+      description: The HA camera entity to snapshot (from the ONVIF integration).
+      required: true
+      selector:
+        entity:
+          domain: camera
+
 format_sd:
   name: Format SD Card
   description: Triggers an SD card format on the specified camera.

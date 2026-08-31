@@ -363,9 +363,16 @@ class TuyaMQTTBridge:
 
         motion_dps = [s for s in status if s.get("code") in ("initiative_message", "movement_detect_pic")]
         if not motion_dps:
-            if dev_id in cameras:
-                codes = [s.get("code") for s in status if s.get("code")]
-                _LOGGER.debug("Known camera %s sent DPS codes %r — no motion codes, skipping", dev_id, codes)
+            codes = [s.get("code") for s in status if s.get("code")]
+            if codes:
+                # Log for ANY device with recognizable DPS codes, not just already-known
+                # cameras — a device outside CAMERA_CATEGORIES (e.g. cdsxj) never gets
+                # into `cameras` at all, so without this we'd have zero visibility into
+                # whatever motion/alarm codes it's actually sending over MQTT. Added
+                # 2026-08-31 while investigating whether Tuya's broker delivers
+                # alarm_message/ipc_human-style events for cdsxj devices at all.
+                label = "Known camera" if dev_id in cameras else "Unrecognized device"
+                _LOGGER.debug("%s %s sent DPS codes %r — no motion codes, skipping", label, dev_id, codes)
             return
 
         cam = cameras.get(dev_id)
@@ -729,6 +736,81 @@ class TuyaMQTTBridge:
         """Notify entity IDs configured for this area/kind (list already, from
         the config flow's multi-select EntitySelector — no parsing needed)."""
         return list(self._recipients_cfg.get(area, {}).get(kind, []))
+
+    async def handle_external_motion(self, area: str, name: str, camera_entity_id: str) -> None:
+        """Handle a motion event from a non-Tuya-MQTT source.
+
+        Added 2026-08-31 for ONVIF-based cameras (specifically Winti Terrasse, whose
+        Tuya cloud/MQTT path is permanently broken — see the cdsxj product-template
+        break in project memory) — HA's native ONVIF integration provides a genuine
+        binary_sensor for motion, and an automation calls the tuya_cameras.handle_
+        onvif_motion service on that sensor turning on, which routes here.
+
+        Reuses the exact same snapshot → AI → email pipeline as the MQTT path, just
+        skipping the Tuya DPS/OSS-image steps since there's no Tuya motion payload —
+        the snapshot comes directly from the already-known HA camera entity instead.
+        """
+        ev_ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        img_bytes = await self._get_ha_snapshot(dev_id=camera_entity_id, entity_id=camera_entity_id)
+        if not img_bytes:
+            _LOGGER.warning("External motion %s/%s: snapshot failed — event discarded", area, name)
+            return
+
+        email_image = img_bytes
+        detected_label: str | None = None
+
+        if self._ai_client is not None:
+            result = await self._ai_client.analyze(img_bytes)
+            if result is None:
+                _LOGGER.warning("External motion %s/%s: AI service unavailable — failing open", area, name)
+            else:
+                if not result["human"]:
+                    _LOGGER.debug(
+                        "External motion %s/%s: no human detected (conf=%.2f) — discarding",
+                        area, name, result["confidence"],
+                    )
+                    if self._ai_stats:
+                        await self._ai_stats.async_record(human=False, area=area, camera=name)
+                        self._hass.bus.async_fire(EVENT_AI_UPDATED)
+                    return
+                _LOGGER.info(
+                    "External motion %s/%s: human detected (conf=%.2f) — alerting",
+                    area, name, result["confidence"],
+                )
+                if self._ai_stats:
+                    await self._ai_stats.async_record(human=True, area=area, camera=name)
+                    self._hass.bus.async_fire(EVENT_AI_UPDATED)
+                email_image = result.get("annotated_image", img_bytes)
+                detected_label = "human"
+
+        subject = (
+            f"{detected_label.capitalize()} detected — {area} / {name} [ONVIF]"
+            if detected_label else f"Motion detected — {area} / {name} [ONVIF]"
+        )
+        body = f"""<html><body>
+<h2 style="color:#c0392b;">Motion Detected</h2>
+<table>
+  <tr><td><b>Camera</b></td><td>{name}</td></tr>
+  <tr><td><b>Area</b></td><td>{area}</td></tr>
+  <tr><td><b>Time</b></td><td>{ev_ts}</td></tr>
+  <tr><td><b>Source</b></td><td style="color:#8e44ad;">ONVIF (local · {self._entry_label})</td></tr>
+</table>
+<br><img src="cid:motion_image" style="max-width:640px; border:1px solid #ccc;">
+<br><p>Check your recording in the camera app.</p>
+</body></html>"""
+
+        to_addrs = self._get_recipients(area, "human")
+        if not to_addrs:
+            _LOGGER.warning(
+                "External motion %s/%s: detection fired but no recipients configured for area %r",
+                area, name, area,
+            )
+            return
+        if not self._alerts_enabled:
+            _LOGGER.debug("External motion %s/%s: alerts disabled — email suppressed", area, name)
+            return
+        await send_email(self._hass, subject, body, to_addrs, email_image)
+        _LOGGER.info("External motion alert sent for %s/%s to %s", area, name, to_addrs)
 
     def _get_all_tech_recipients(self) -> list[str]:
         """Deduplicated notify entity IDs across every area's tech recipients."""

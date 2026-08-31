@@ -6,6 +6,8 @@ import asyncio
 import logging
 from datetime import timedelta
 
+import voluptuous as vol
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import HomeAssistant, ServiceCall, callback
@@ -96,6 +98,32 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         await _update_lovelace_views(hass)
 
     hass.services.async_register(DOMAIN, "refresh_all", _handle_refresh_all)
+
+    async def _handle_onvif_motion(call: ServiceCall) -> None:
+        """Route a motion event from a non-Tuya-MQTT source (currently: an ONVIF
+        camera's binary_sensor, via automation) to the matching entry's bridge.
+        See TuyaMQTTBridge.handle_external_motion for why this exists.
+        """
+        entry_id = call.data["entry_id"]
+        data = hass.data.get(DOMAIN, {}).get(entry_id)
+        if not isinstance(data, dict) or "bridge" not in data:
+            _LOGGER.error("handle_onvif_motion: unknown or unloaded entry_id %s", entry_id)
+            return
+        await data["bridge"].handle_external_motion(
+            area=call.data["area"],
+            name=call.data["name"],
+            camera_entity_id=call.data["camera_entity_id"],
+        )
+
+    hass.services.async_register(
+        DOMAIN, "handle_onvif_motion", _handle_onvif_motion,
+        schema=vol.Schema({
+            vol.Required("entry_id"): str,
+            vol.Required("area"): str,
+            vol.Required("name"): str,
+            vol.Required("camera_entity_id"): str,
+        }),
+    )
     return True
 
 
