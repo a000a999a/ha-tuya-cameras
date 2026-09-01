@@ -23,6 +23,9 @@ from .const import (
     CONF_CAMERA_ANIMAL_CONFIG,
     CONF_CORE_ENTRY_ID, CONF_RECIPIENTS, CONF_REFRESH_DAYS, DEFAULT_REFRESH_DAYS,
     CONF_MQTT_ALERTS_ENABLED, CONF_WEBHOOK_ALERTS_ENABLED,
+    CONF_RECORDING_ENABLED, CONF_RECORDING_DURATION_S,
+    CONF_RECORDING_PATH, CONF_RECORDING_RETENTION_DAYS,
+    DEFAULT_RECORDING_DURATION_S, DEFAULT_RECORDING_PATH, DEFAULT_RECORDING_RETENTION_DAYS,
     DOMAIN, DOMAIN_CORE,
 )
 from .coordinator import CameraCoordinator
@@ -739,6 +742,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     webhook_enabled = entry.options.get(CONF_WEBHOOK_ALERTS_ENABLED, False)
     animal_cfg      = entry.options.get(CONF_CAMERA_ANIMAL_CONFIG, {})
 
+    recording_enabled        = entry.options.get(CONF_RECORDING_ENABLED, False)
+    recording_duration_s     = entry.options.get(CONF_RECORDING_DURATION_S, DEFAULT_RECORDING_DURATION_S)
+    recording_path           = entry.options.get(CONF_RECORDING_PATH, DEFAULT_RECORDING_PATH)
+    recording_retention_days = entry.options.get(CONF_RECORDING_RETENTION_DAYS, DEFAULT_RECORDING_RETENTION_DAYS)
+
     bridge = TuyaMQTTBridge(
         hass           = hass,
         tuya_client    = tuya_client,
@@ -754,6 +762,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry_label    = entry.title,
         animal_cfg     = animal_cfg,
         entry_id       = entry.entry_id,
+        recording_enabled        = recording_enabled,
+        recording_duration_s     = recording_duration_s,
+        recording_path           = recording_path,
+        recording_retention_days = recording_retention_days,
     )
 
     domain_data = hass.data.setdefault(DOMAIN, {})
@@ -817,6 +829,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         async_track_time_interval(
             hass, _schedule_health_check, timedelta(seconds=WATCHDOG_CHECK_S),
         )
+    )
+
+    # Recording housekeeping (retention cleanup + low-disk-space check/prune) — its
+    # own schedule, independent of new recordings being written, so a long stretch
+    # of no motion doesn't leave expired clips sitting past their retention window.
+    # No-op inside run_housekeeping() if recording was never enabled for this entry.
+    @callback
+    def _schedule_housekeeping(_now) -> None:
+        hass.async_create_task(bridge.run_housekeeping())
+
+    entry.async_on_unload(
+        async_track_time_interval(hass, _schedule_housekeeping, timedelta(hours=6))
     )
 
     hass.async_create_task(_update_lovelace_views(hass))

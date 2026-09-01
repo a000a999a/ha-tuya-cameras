@@ -30,6 +30,7 @@ from .ai_stats import AIStats
 from .camera_api import CameraAPI
 from .const import EVENT_AI_UPDATED
 from .notify_helper import send_email
+from .recording_helper import housekeep_recordings, start_recording
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -80,6 +81,10 @@ class TuyaMQTTBridge:
         entry_label: str = "",
         animal_cfg: dict | None = None,
         entry_id: str = "",
+        recording_enabled: bool = False,
+        recording_duration_s: int = 60,
+        recording_path: str = "tuya_cameras/recordings",
+        recording_retention_days: int = 7,
     ) -> None:
         self._hass           = hass
         self._entry_id       = entry_id
@@ -95,6 +100,10 @@ class TuyaMQTTBridge:
         self._alerts_enabled = alerts_enabled
         self._entry_label    = entry_label or uid  # used in tech alerts + motion email source tag
         self._animal_cfg     = animal_cfg or {}    # {device_id: {enabled, classes}}
+        self._recording_enabled        = recording_enabled
+        self._recording_duration_s     = recording_duration_s
+        self._recording_path           = recording_path
+        self._recording_retention_days = recording_retention_days
         self._task: asyncio.Task | None = None
         self._local_keys: dict[str, str] = {}    # device_id → local_key
         self._product_ids: dict[str, str] = {}  # device_id → product_id (for v4 blob decrypt)
@@ -421,6 +430,10 @@ class TuyaMQTTBridge:
         img_bytes     = None
         snap_note     = ""
         prefetched_ai: dict | None = None
+        # Resolved unconditionally (not just in the snapshot-fallback branch below) —
+        # recording needs the camera entity regardless of whether the image itself
+        # came from OSS or a live snapshot.
+        cam_entity_id = await self._find_camera_entity_id(dev_id)
 
         if ev.get("bucket") and ev.get("files"):
             if ev["bucket"] == "__inline_jpeg__":
@@ -454,7 +467,6 @@ class TuyaMQTTBridge:
 
         if not img_bytes:
             _LOGGER.debug("Motion %s/%s: no OSS image — trying HA snapshot(s)", area, name)
-            cam_entity_id = await self._find_camera_entity_id(dev_id)
             snap_hashes: list[str] = []
             last_attempt = len(SNAPSHOT_RETRY_DELAYS_S) - 1
             for attempt, delay in enumerate(SNAPSHOT_RETRY_DELAYS_S):
@@ -576,6 +588,7 @@ class TuyaMQTTBridge:
                         "Motion %s/%s: human detected (conf=%.2f) — alerting",
                         area, name, ai_result["confidence"],
                     )
+                    await self._maybe_record(area, name, cam_entity_id)
                 if animal_label:
                     _LOGGER.info("Motion %s/%s: animal detected (%s) — alerting", area, name, animal_label)
 
@@ -737,6 +750,36 @@ class TuyaMQTTBridge:
         the config flow's multi-select EntitySelector — no parsing needed)."""
         return list(self._recipients_cfg.get(area, {}).get(kind, []))
 
+    async def _maybe_record(self, area: str, name: str, camera_entity_id: str | None) -> None:
+        """Start a local recording if enabled — called only after a human has
+        already been confirmed by AI, never on raw/unfiltered motion. Fired as a
+        background task, not awaited inline: start_recording() now pre-warms the
+        camera's stream for a few seconds before recording (see recording_helper.py
+        "Stream warm-up"), which must never delay the alert email that follows this
+        call at both call sites. Failures are logged and swallowed either way — a
+        recording problem must never affect whether the alert email itself gets sent.
+        """
+        if not self._recording_enabled or not camera_entity_id:
+            return
+        self._hass.async_create_task(
+            start_recording(
+                self._hass, camera_entity_id, area, name,
+                self._recording_duration_s, self._recording_path,
+            )
+        )
+
+    async def run_housekeeping(self) -> None:
+        """Retention-based cleanup + low-disk-space check/prune for recordings.
+        Called on a schedule from __init__.py — see async_track_time_interval
+        registration there. No-op if recording was never enabled for this entry.
+        """
+        if not self._recording_enabled:
+            return
+        await housekeep_recordings(
+            self._hass, self._recording_path, self._recording_retention_days,
+            self._send_tech_alert,
+        )
+
     async def handle_external_motion(self, area: str, name: str, camera_entity_id: str) -> None:
         """Handle a motion event from a non-Tuya-MQTT source.
 
@@ -746,42 +789,79 @@ class TuyaMQTTBridge:
         binary_sensor for motion, and an automation calls the tuya_cameras.handle_
         onvif_motion service on that sensor turning on, which routes here.
 
-        Reuses the exact same snapshot → AI → email pipeline as the MQTT path, just
-        skipping the Tuya DPS/OSS-image steps since there's no Tuya motion payload —
-        the snapshot comes directly from the already-known HA camera entity instead.
+        Reuses the exact same snapshot → AI → email pipeline as the MQTT path,
+        including the same SNAPSHOT_RETRY_DELAYS_S multi-attempt retry (added
+        2026-08-31 — the original single-shot version had no way to catch a subject
+        who wasn't perfectly framed at the exact trigger instant, unlike the MQTT
+        path). Skips the Tuya DPS/OSS-image steps since there's no Tuya motion
+        payload — the snapshot comes directly from the already-known HA camera
+        entity instead, over the local network (no cloud relay, so typically much
+        faster per-attempt than the MQTT path's go2rtc/cloud-relayed snapshots).
         """
         ev_ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        img_bytes = await self._get_ha_snapshot(dev_id=camera_entity_id, entity_id=camera_entity_id)
-        if not img_bytes:
-            _LOGGER.warning("External motion %s/%s: snapshot failed — event discarded", area, name)
-            return
 
-        email_image = img_bytes
-        detected_label: str | None = None
+        img_bytes: bytes | None = None
+        email_image: bytes | None = None
+        human_found = False
+        ai_unavailable = False
+        last_attempt_idx = len(SNAPSHOT_RETRY_DELAYS_S) - 1
 
-        if self._ai_client is not None:
-            result = await self._ai_client.analyze(img_bytes)
+        for attempt, delay in enumerate(SNAPSHOT_RETRY_DELAYS_S):
+            if delay:
+                await asyncio.sleep(delay)
+            snap = await self._get_ha_snapshot(dev_id=camera_entity_id, entity_id=camera_entity_id)
+            if not snap:
+                _LOGGER.debug(
+                    "External motion %s/%s: snapshot %d/%d failed",
+                    area, name, attempt + 1, len(SNAPSHOT_RETRY_DELAYS_S),
+                )
+                continue
+
+            img_bytes = snap  # keep the most recent successful snapshot as a fallback
+
+            if self._ai_client is None:
+                break  # non-AI mode: alert on first successful snapshot
+
+            result = await self._ai_client.analyze(snap)
             if result is None:
                 _LOGGER.warning("External motion %s/%s: AI service unavailable — failing open", area, name)
-            else:
-                if not result["human"]:
-                    _LOGGER.debug(
-                        "External motion %s/%s: no human detected (conf=%.2f) — discarding",
-                        area, name, result["confidence"],
-                    )
-                    if self._ai_stats:
-                        await self._ai_stats.async_record(human=False, area=area, camera=name)
-                        self._hass.bus.async_fire(EVENT_AI_UPDATED)
-                    return
+                ai_unavailable = True
+                break
+
+            if result["human"]:
                 _LOGGER.info(
-                    "External motion %s/%s: human detected (conf=%.2f) — alerting",
-                    area, name, result["confidence"],
+                    "External motion %s/%s: human found at +%.1fs (conf=%.2f)",
+                    area, name, delay, result["confidence"],
                 )
-                if self._ai_stats:
-                    await self._ai_stats.async_record(human=True, area=area, camera=name)
-                    self._hass.bus.async_fire(EVENT_AI_UPDATED)
-                email_image = result.get("annotated_image", img_bytes)
-                detected_label = "human"
+                human_found  = True
+                email_image  = result.get("annotated_image", snap)
+                await self._maybe_record(area, name, camera_entity_id)
+                break
+
+            _LOGGER.debug(
+                "External motion %s/%s: no human at +%.1fs (conf=%.2f)%s",
+                area, name, delay, result["confidence"],
+                " — retrying" if attempt < last_attempt_idx else " — all attempts exhausted",
+            )
+
+        if not img_bytes:
+            _LOGGER.warning("External motion %s/%s: all snapshot attempts failed — event discarded", area, name)
+            return
+
+        if self._ai_client is not None and not human_found and not ai_unavailable:
+            # Ran the full retry schedule, AI responded every time, never found a human.
+            if self._ai_stats:
+                await self._ai_stats.async_record(human=False, area=area, camera=name)
+                self._hass.bus.async_fire(EVENT_AI_UPDATED)
+            return
+
+        if human_found and self._ai_stats:
+            await self._ai_stats.async_record(human=True, area=area, camera=name)
+            self._hass.bus.async_fire(EVENT_AI_UPDATED)
+
+        if email_image is None:
+            email_image = img_bytes
+        detected_label = "human" if human_found else None
 
         subject = (
             f"{detected_label.capitalize()} detected — {area} / {name} [ONVIF]"

@@ -55,3 +55,14 @@ ANIMAL_COCO_CLASSES = [
     "bird", "cat", "dog", "horse", "sheep",
     "cow", "elephant", "bear", "zebra", "giraffe",
 ]
+
+# Local recording on human detection (2026-08-31). Applies to both the MQTT and
+# ONVIF motion paths — recording starts only after a human is confirmed, never on
+# raw/unfiltered motion, so a false positive never burns a clip. See recording_helper.py.
+CONF_RECORDING_ENABLED        = "recording_enabled"
+CONF_RECORDING_DURATION_S     = "recording_duration_s"
+CONF_RECORDING_PATH           = "recording_path"
+CONF_RECORDING_RETENTION_DAYS = "recording_retention_days"
+DEFAULT_RECORDING_DURATION_S     = 60
+DEFAULT_RECORDING_PATH           = "tuya_cameras/recordings"  # relative to /config/www — see recording_helper.py
+DEFAULT_RECORDING_RETENTION_DAYS = 7

@@ -24,9 +24,16 @@ from .const import (
     CONF_REFRESH_DAYS,
     CONF_SD_ALERT_THRESHOLD,
     CONF_TECH_RECIPIENTS,
+    CONF_RECORDING_ENABLED,
+    CONF_RECORDING_DURATION_S,
+    CONF_RECORDING_PATH,
+    CONF_RECORDING_RETENTION_DAYS,
     DEFAULT_AI_URL,
     DEFAULT_REFRESH_DAYS,
     DEFAULT_SD_ALERT_THRESHOLD,
+    DEFAULT_RECORDING_DURATION_S,
+    DEFAULT_RECORDING_PATH,
+    DEFAULT_RECORDING_RETENTION_DAYS,
     DOMAIN,
     DOMAIN_CORE,
 )
@@ -150,8 +157,47 @@ class TuyaCamerasOptionsFlow(OptionsFlow):
     async def async_step_init(self, user_input: dict | None = None) -> ConfigFlowResult:
         return self.async_show_menu(
             step_id="init",
-            menu_options=["edit_recipients", "edit_settings", "edit_ai", "edit_alerts", "edit_animal"],
+            menu_options=[
+                "edit_recipients", "edit_settings", "edit_ai", "edit_alerts",
+                "edit_animal", "edit_recording",
+            ],
         )
+
+    async def async_step_edit_recording(self, user_input: dict | None = None) -> ConfigFlowResult:
+        if user_input is not None:
+            new_options = {
+                **self._entry.options,
+                CONF_RECIPIENTS:                 self._recipients,
+                CONF_RECORDING_ENABLED:          bool(user_input[CONF_RECORDING_ENABLED]),
+                CONF_RECORDING_DURATION_S:       int(user_input[CONF_RECORDING_DURATION_S]),
+                CONF_RECORDING_PATH:             user_input[CONF_RECORDING_PATH].strip("/"),
+                CONF_RECORDING_RETENTION_DAYS:   int(user_input[CONF_RECORDING_RETENTION_DAYS]),
+            }
+            return self.async_create_entry(data=new_options)
+
+        o = self._entry.options
+        schema = vol.Schema({
+            vol.Optional(CONF_RECORDING_ENABLED, default=o.get(CONF_RECORDING_ENABLED, False)):
+                selector.BooleanSelector(),
+            vol.Optional(CONF_RECORDING_DURATION_S,
+                         default=o.get(CONF_RECORDING_DURATION_S, DEFAULT_RECORDING_DURATION_S)):
+                selector.NumberSelector(selector.NumberSelectorConfig(
+                    min=10, max=300, step=5,
+                    mode=selector.NumberSelectorMode.BOX,
+                    unit_of_measurement="seconds",
+                )),
+            vol.Optional(CONF_RECORDING_PATH,
+                         default=o.get(CONF_RECORDING_PATH, DEFAULT_RECORDING_PATH)):
+                selector.TextSelector(),
+            vol.Optional(CONF_RECORDING_RETENTION_DAYS,
+                         default=o.get(CONF_RECORDING_RETENTION_DAYS, DEFAULT_RECORDING_RETENTION_DAYS)):
+                selector.NumberSelector(selector.NumberSelectorConfig(
+                    min=1, max=90, step=1,
+                    mode=selector.NumberSelectorMode.BOX,
+                    unit_of_measurement="days",
+                )),
+        })
+        return self.async_show_form(step_id="edit_recording", data_schema=schema)
 
     async def async_step_edit_settings(self, user_input: dict | None = None) -> ConfigFlowResult:
         if user_input is not None:

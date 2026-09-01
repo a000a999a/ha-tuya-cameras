@@ -120,6 +120,39 @@ One button per camera. Press to format via Tuya Cloud API — no confirmation pr
 - `sensor.<name>_sd_usage` — SD usage %
 - `sensor.<name>_status` — online / offline
 
+### Local recording on human detection
+Records a video clip via `camera.record` when AI confirms a human — never on raw,
+unfiltered motion, so a false positive never burns a clip. Applies to both the MQTT
+and ONVIF motion paths. Configure under Settings → Devices & Services → Tuya Cameras
+→ Configure → "Local recording on human detection": enable/disable, clip duration,
+storage path, and retention period. A separate housekeeping job runs on its own
+6-hour schedule, deleting recordings past the retention period and, if disk space
+still runs low afterwards, pruning the oldest remaining files and sending a tech
+alert. Videos are referenced by file path in the alert email, never attached.
+
+**Storage location:** recordings are written under `/config/www` (e.g.
+`/config/www/tuya_cameras/recordings` by default), not the media-source "local"
+root. This isn't an arbitrary choice — it's the only local path Home Assistant's
+own `camera.record` service (`stream.async_record()`) will write to without
+extra setup. HA enforces its own security allowlist independent of filesystem
+permissions; straight from `core_config.py`:
+
+```python
+hac.allowlist_external_dirs = {hass.config.path("www"), *hac.media_dirs.values()}
+```
+
+Only two locations are auto-allowed with zero configuration: `media_dirs["local"]`
+(which on a Docker install defaults to `/media` — typically not bind-mounted to
+a host path, so anything written there is lost the moment the container is
+*recreated*, not just restarted) and `<config>/www/`. `/config` is guaranteed to
+be a real, host-persistent, already-bind-mounted directory on every HA install
+type (Docker, HAOS, Supervised, Core), and `www/` is served by HA at `/local/...`
+too, so recordings land somewhere durable and browsable with zero extra setup —
+no Docker volume, no `configuration.yaml` edit, no HACS dependency. If you'd
+rather store recordings elsewhere, add the target directory to
+`allowlist_external_dirs` in `configuration.yaml` yourself; the storage-path
+field is otherwise always resolved relative to `/config/www`.
+
 ## Services
 
 | Service | Scope | Description |

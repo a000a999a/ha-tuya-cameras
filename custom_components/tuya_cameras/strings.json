@@ -28,7 +28,8 @@
           "edit_settings":   "Refresh interval & SD alert threshold",
           "edit_ai":         "AI human detection",
           "edit_alerts":     "Motion alert sources",
-          "edit_animal":     "Camera animal detection"
+          "edit_animal":     "Camera animal detection",
+          "edit_recording":  "Local recording on human detection"
         }
       },
       "edit_settings": {
@@ -80,6 +81,16 @@
         "data": {
           "enabled": "Enable animal detection",
           "classes": "Animal classes to detect"
+        }
+      },
+      "edit_recording": {
+        "title": "Local Recording",
+        "description": "Records a local video clip when a human is confirmed (never on raw/unfiltered motion, so a false positive never burns a clip). Applies to both the MQTT and ONVIF motion paths. Housekeeping (retention cleanup + low-disk-space pruning) runs automatically on its own schedule. Recordings are stored under /config/www — the only local path Home Assistant's camera.record service allows writing to without extra configuration.yaml setup, and it lives on real, host-persistent storage without requiring any extra Docker volume.",
+        "data": {
+          "recording_enabled":        "Enable local recording",
+          "recording_duration_s":     "Recording duration",
+          "recording_path":           "Storage path (relative to /config/www)",
+          "recording_retention_days": "Retention period"
         }
       }
     },
