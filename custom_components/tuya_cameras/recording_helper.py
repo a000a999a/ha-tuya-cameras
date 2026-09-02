@@ -70,8 +70,16 @@ LOW_DISK_GB      = 5
 LOW_DISK_PERCENT = 5
 
 # How long to let a freshly-opened stream stabilize before recording from it —
-# see module docstring "Stream warm-up".
-STREAM_WARMUP_S = 3
+# see module docstring "Stream warm-up". Raised from 3s to 12s on 2026-09-02:
+# 3s reduced but did not eliminate the non-monotonic-dts muxer failure on
+# Tuya-cloud-relayed cameras — roughly half of real events still failed
+# (confirmed via actual .mp4 vs orphaned .mp4.tmp files on disk, not just log
+# lines). ONVIF-sourced recordings (a direct LAN connection, no cloud relay)
+# have had zero failures regardless of warm-up duration, consistent with the
+# relay path being the actual source of instability, not the local stream
+# handling — a longer warm-up gives the relay connection more time to settle
+# before the muxer starts trusting its timestamps.
+STREAM_WARMUP_S = 12
 
 
 def _recordings_root(hass: HomeAssistant, path_root: str) -> Path:
