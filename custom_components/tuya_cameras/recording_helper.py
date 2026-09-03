@@ -47,6 +47,29 @@ one). So start_recording() now pre-warms the same cached Stream itself —
 calling camera.async_create_stream() and giving it a few seconds — before
 calling the camera.record service, so the record call reuses an
 already-stabilizing connection instead of cold-starting its own.
+
+Stale RTSP URL refresh: confirmed live 2026-09-02/03 that camera.async_create_stream() alone
+isn't enough — it just returns whatever RTSP URL is already cached for that camera (via the
+official Tuya integration / go2rtc), and if that URL's signed token has already expired, the
+stream fails outright with `stream_worker ... 404 Not Found`, over and over, no matter how long
+the warm-up sleep is. Confirmed on three different cameras across one evening (Camera Door,
+Panorama Camera escadas, Lago Camera), and confirmed NOT self-recovering even after 9+ minutes of
+automatic retries. Worse, once a recording's stream never successfully opens, its recorder object
+never reaches finish_writing() (see stream/recorder.py), so HA never releases the "recording"
+flag — every later recording attempt on that SAME camera then fails too, with
+`HomeAssistantError: Stream already recording to ...`, until something forces a fresh Stream
+(a full HA restart — confirmed working but a heavy hammer, and not durable since the underlying
+cause recurs).
+
+This repo already had a proven fix for exactly this class of problem, just not applied to
+recording yet: mqtt_bridge.py's snapshot-heal path (`_attempt_rtsp_heal`, live since v0.6.1)
+calls the `homeassistant.update_entity` service on the camera before retrying, which forces the
+official Tuya integration to fetch a fresh signed RTSP URL from Tuya's cloud rather than reusing
+a stale cached one. start_recording() now does the same thing, before calling
+async_create_stream(), to reduce the odds of a NEW recording ever hitting a dead URL in the first
+place. Important limitation: this does NOT un-stick an already-stuck camera (one whose Stream
+object is already wedged from a prior failed attempt) — that still needs a restart or a scoped
+config-entry reload. It only helps prevent the initial 404 that starts the stuck cascade.
 """
 
 from __future__ import annotations
@@ -81,6 +104,12 @@ LOW_DISK_PERCENT = 5
 # before the muxer starts trusting its timestamps.
 STREAM_WARMUP_S = 12
 
+# How long to wait after homeassistant.update_entity before trusting the camera has a
+# fresh RTSP URL — see module docstring "Stale RTSP URL refresh". Mirrors the value
+# already proven live in mqtt_bridge.py's snapshot-heal path (_attempt_rtsp_heal);
+# not yet independently re-tuned for this specific call path.
+RTSP_REFRESH_WAIT_S = 15
+
 
 def _recordings_root(hass: HomeAssistant, path_root: str) -> Path:
     """Root directory for a given recording_path config value, under /config/www —
@@ -105,11 +134,12 @@ async def start_recording(
     """Kick off camera.record for duration_s seconds. Returns the saved file's
     absolute path (for referencing in the alert email), or None on failure.
 
-    Pre-warms the camera's stream before recording (see module docstring
-    "Stream warm-up") — this makes the call take STREAM_WARMUP_S seconds longer
-    than before, so callers must NOT await this inline on the alert-email path;
-    fire it as a background task instead (mqtt_bridge.py's _maybe_record does
-    this via hass.async_create_task).
+    Refreshes the camera's RTSP URL and pre-warms its stream before recording (see
+    module docstring "Stale RTSP URL refresh" and "Stream warm-up") — this makes the
+    call take up to RTSP_REFRESH_WAIT_S + STREAM_WARMUP_S seconds longer than before,
+    so callers must NOT await this inline on the alert-email path; fire it as a
+    background task instead (mqtt_bridge.py's _maybe_record does this via
+    hass.async_create_task).
     """
     try:
         media_root = _recordings_root(hass, path_root)
@@ -118,6 +148,20 @@ async def start_recording(
         ts = time.strftime("%Y-%m-%d_%H-%M-%S", time.gmtime())
         filename  = f"{_safe_slug(area)}_{_safe_slug(name)}_{ts}.mp4"
         full_path = media_root / filename
+
+        try:
+            await hass.services.async_call(
+                "homeassistant", "update_entity",
+                {"entity_id": camera_entity_id},
+                blocking=True,
+            )
+            await asyncio.sleep(RTSP_REFRESH_WAIT_S)
+        except Exception as refresh_err:  # noqa: BLE001 — refresh is best-effort only
+            _LOGGER.warning(
+                "RTSP URL refresh failed for %s/%s (%s) — recording anyway, may hit a "
+                "stale-token 404 if the cached URL has already expired",
+                area, name, refresh_err,
+            )
 
         try:
             camera_entity = get_camera_from_entity_id(hass, camera_entity_id)
