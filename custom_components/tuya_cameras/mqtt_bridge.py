@@ -375,11 +375,11 @@ class TuyaMQTTBridge:
             codes = [s.get("code") for s in status if s.get("code")]
             if codes:
                 # Log for ANY device with recognizable DPS codes, not just already-known
-                # cameras — a device outside CAMERA_CATEGORIES (e.g. cdsxj) never gets
-                # into `cameras` at all, so without this we'd have zero visibility into
-                # whatever motion/alarm codes it's actually sending over MQTT. Added
-                # 2026-08-31 while investigating whether Tuya's broker delivers
-                # alarm_message/ipc_human-style events for cdsxj devices at all.
+                # cameras — a device whose product has no Standard Instruction mapping
+                # (e.g. cdsxj) never sends any DPS at all, so without this we'd have zero
+                # visibility into whatever motion/alarm codes it's actually sending over
+                # MQTT, if anything. Added 2026-08-31 while investigating whether Tuya's
+                # broker delivers alarm_message/ipc_human-style events for cdsxj devices.
                 label = "Known camera" if dev_id in cameras else "Unrecognized device"
                 _LOGGER.debug("%s %s sent DPS codes %r — no motion codes, skipping", label, dev_id, codes)
             return

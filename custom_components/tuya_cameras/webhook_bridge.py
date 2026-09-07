@@ -79,7 +79,17 @@ class SmartLifeWebhookBridge:
         hass.async_create_task(self._process(hass, title, text, img_bytes))
 
     async def _process(self, hass: Any, title: str, text: str, img_bytes: bytes | None) -> None:
-        area, cam_name, entry_data, dev_id = self._find_camera(title, text)
+        area, cam_name, entry_data, dev_id, mqtt_capable = self._find_camera(title, text)
+
+        # MQTT already delivers this camera's motion (and ~2-3s faster) — processing it
+        # here too would just duplicate the alert. Only cameras Tuya can't map via
+        # Standard Instruction (e.g. cdsxj) rely on this path.
+        if mqtt_capable:
+            _LOGGER.debug(
+                "SmartLife webhook %s/%s: camera has a working MQTT path — skipping",
+                area, cam_name,
+            )
+            return
 
         # Respect the per-entry webhook toggle
         if entry_data and not entry_data.get("webhook_alerts_enabled", False):
@@ -242,14 +252,14 @@ class SmartLifeWebhookBridge:
     # Words too generic to use for partial matching (appear in both camera names and notification text)
     _GENERIC_WORDS = {"camera", "smart", "motion", "detected", "detect", "alert", "cam"}
 
-    def _find_camera(self, title: str, text: str) -> tuple[str, str, dict | None, str | None]:
+    def _find_camera(self, title: str, text: str) -> tuple[str, str, dict | None, str | None, bool]:
         """Match notification title/text against known camera names.
 
         Two-pass strategy:
         1. Exact: full camera name appears anywhere in title+text (case-insensitive)
         2. Partial: a distinctive word (>4 chars, not generic) from the name appears in title+text
         Falls back to title as camera name if nothing matches.
-        Returns (area, cam_name, entry_data, dev_id).
+        Returns (area, cam_name, entry_data, dev_id, mqtt_capable).
         """
         search = f"{title} {text}".lower()
         all_entries = self._all_entry_data()
@@ -274,7 +284,7 @@ class SmartLifeWebhookBridge:
         for entry_data in all_entries:
             for cam in _cameras_for(entry_data):
                 if cam["name"].lower() in search:
-                    return cam.get("area", "Unknown"), cam["name"], entry_data, cam.get("id")
+                    return cam.get("area", "Unknown"), cam["name"], entry_data, cam.get("id"), cam.get("mqtt_capable", False)
 
         # Pass 2 — distinctive word match (skip generic words)
         for entry_data in all_entries:
@@ -284,10 +294,10 @@ class SmartLifeWebhookBridge:
                     if len(p) > 4 and p not in self._GENERIC_WORDS
                 ]
                 if distinctive and any(p in search for p in distinctive):
-                    return cam.get("area", "Unknown"), cam["name"], entry_data, cam.get("id")
+                    return cam.get("area", "Unknown"), cam["name"], entry_data, cam.get("id"), cam.get("mqtt_capable", False)
 
         fallback_name = title or text or "Unknown Camera"
-        return "SmartLife", fallback_name, all_entries[0] if all_entries else None, None
+        return "SmartLife", fallback_name, all_entries[0] if all_entries else None, None, False
 
     # ── Entry data helpers ────────────────────────────────────────────────────
 

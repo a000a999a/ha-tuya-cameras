@@ -15,8 +15,15 @@ CONF_TECH_RECIPIENTS  = "tech"
 CONF_HA_TOKEN = "ha_token"
 CONF_HA_URL   = "ha_url"
 
-# Tuya camera device categories
-CAMERA_CATEGORIES = {"sp", "ipc", "dh", "nvr", "sp-new"}
+# Categories with a real Standard Instruction mapping — motion arrives via MQTT/DPS.
+MQTT_CAPABLE_CATEGORIES = {"sp", "ipc", "dh", "nvr", "sp-new"}
+
+# All categories shown in our camera list. Adds cdsxj on top of MQTT_CAPABLE_CATEGORIES:
+# those devices have no Standard Instruction mapping (Tuya-side product-template gap,
+# confirmed unfixable) so they never get real video/DPS — included anyway so they get
+# a name+area (for SmartLife webhook routing) instead of falling into the "SmartLife"
+# pseudo-area with no recipients.
+CAMERA_CATEGORIES = MQTT_CAPABLE_CATEGORIES | {"cdsxj"}
 
 # Motion event DPS codes
 MOTION_CODES = {"initiative_message", "movement_detect_pic"}

@@ -48,6 +48,12 @@ Built APK: `ha-tuya-cameras/android/SmartLifeBridge-1.0.apk` — installed on SM
 - `_GENERIC_WORDS = {"camera", "smart", "motion", "detected", "detect", "alert", "cam"}` — excluded to prevent "Camera Door" matching "Camera Tatuapé Garagen".
 - Fallback: uses notification title as camera name, first available entry data.
 
+**Per-device MQTT-capability skip (added 2026-09-07, v0.11.6):**
+- Before anything else, `_process()` checks the matched camera's `mqtt_capable` flag (from `cameras_from_devices()`/`_cameras_from_registry()`, derived from `MQTT_CAPABLE_CATEGORIES` in `const.py`). If `True`, the event is skipped (debug-logged) — that camera already gets its motion via MQTT ~2-3s faster, and processing it here too would just duplicate the alert.
+- Only cameras with no Standard Instruction mapping at all (currently: category `cdsxj`, see the product-template-gap entry in the master `CLAUDE.md`) have `mqtt_capable=False` and actually rely on this pipeline.
+- Registry-fallback cameras (from `_cameras_from_registry()`) are always `mqtt_capable=True` by construction — that fallback only ever returns devices with a real `camera.*` entity, which `cdsxj` devices never have.
+- A camera that matches nothing in `_find_camera()` (unknown notification) defaults to `mqtt_capable=False` — same as before this change, still falls into the unrouted `"SmartLife"` pseudo-area with no recipients.
+
 **Global instance, per-entry toggle:**
 - One `SmartLifeWebhookBridge` instance shared across all config entries (started when any entry enables it).
 - Each entry independently enables/disables via `webhook_alerts_enabled` option (default off).
@@ -121,6 +127,7 @@ Webhook pipeline coverage: all three account/entry types are covered by `_find_c
 - [ ] Webhook toggle (webhook_alerts_enabled) must default to False — do not change this default
 - [ ] MQTT toggle (mqtt_alerts_enabled) must default to True — skips email only, AI stats + snapshots always run
 - [ ] SmartLifeWebhookBridge is a single global instance — start when any entry enables it, stop when none do; never register the same webhook ID twice
+- [ ] `webhook_bridge._process()` must keep checking `mqtt_capable` first and skipping when `True` — this is the only thing preventing every MQTT-capable camera from double-alerting through both pipelines on every real event
 - [ ] Android build: always use JDK 21; JDK 26 incompatible with Gradle 8.7
 - [ ] Tablet reboot required after granting notification access on LineageOS (service must rebind)
 - [ ] Android manifest: `foregroundServiceType="specialUse"` + `FOREGROUND_SERVICE_SPECIAL_USE` permission required for targetSdk=35 — missing causes immediate crash + 30-min restart penalty

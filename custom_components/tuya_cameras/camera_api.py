@@ -12,6 +12,7 @@ from .const import (
     CAMERA_CATEGORIES,
     CONF_HA_TOKEN,
     CONF_HA_URL,
+    MQTT_CAPABLE_CATEGORIES,
     SD_STATUS_LABELS,
 )
 
@@ -44,10 +45,11 @@ class CameraAPI:
                 continue
             dev_id = d["id"]
             cams.append({
-                "id":      dev_id,
-                "name":    d.get("name", dev_id).strip(),
-                "area":    area_map.get(dev_id, ""),
-                "online":  d.get("online", False),
+                "id":           dev_id,
+                "name":         d.get("name", dev_id).strip(),
+                "area":         area_map.get(dev_id, ""),
+                "online":       d.get("online", False),
+                "mqtt_capable": d.get("category", "").lower() in MQTT_CAPABLE_CATEGORIES,
             })
         return cams
 

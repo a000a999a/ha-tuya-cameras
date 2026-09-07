@@ -189,6 +189,8 @@ class CameraCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     name, dev_id,
                 )
 
-            cameras.append({"id": dev_id, "name": name, "area": area_name, "online": True})
+            # Only real HA camera.* entities land here — cdsxj devices have none, so
+            # anything from this fallback is definitionally MQTT-capable.
+            cameras.append({"id": dev_id, "name": name, "area": area_name, "online": True, "mqtt_capable": True})
 
         return cameras
