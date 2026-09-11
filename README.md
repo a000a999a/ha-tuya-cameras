@@ -179,12 +179,23 @@ that, you'll get an alert asking for a manual look instead.
 
 This has fired for real in production (not just tested) — the forced-reconnect
 tier specifically. If you see it firing repeatedly for the *same* camera project on
-a recurring schedule rather than as an occasional one-off, that's worth investigating
-as its own issue (a project reconnecting cleanly once and then staying silent again
-within the hour points at something upstream — session/credential handling or
-network path — rather than a problem this watchdog itself can fix; it will keep
-nudging it back each time either way, so alerts won't go unnoticed, but it isn't a
-substitute for finding the root cause).
+a recurring schedule rather than as an occasional one-off, that usually just means
+that project's devices are genuinely offline (see **Pause watchdog alerts** below) —
+but if you know they aren't, it's worth investigating as its own issue: something
+upstream (session/credential handling, network path) rather than a problem this
+watchdog itself can fix.
+
+#### Pause watchdog alerts (site deliberately offline)
+
+If a project's devices are intentionally taken offline for a while — a site's router
+unplugged on purpose, hardware pulled for maintenance — the watchdog above has no way
+to tell "deliberately offline" apart from "broken," and will otherwise keep nudging
+and alerting every hour indefinitely. **Configure → Pause watchdog alerts** lets you
+tell it to stand down for that project specifically, for 30/60/90 days (or switch
+back to Off to resume immediately, any time). While paused, the watchdog skips its
+health check entirely for that entry — no reconnect/reload attempts, no tech-alert
+emails. It does **not** affect motion, SD, or any other alert type, and resumes
+automatically once the chosen period elapses.
 
 ## Refresh All Cameras
 

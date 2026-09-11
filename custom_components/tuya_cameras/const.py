@@ -54,6 +54,12 @@ CONF_MQTT_ALERTS_ENABLED    = "mqtt_alerts_enabled"
 CONF_WEBHOOK_ALERTS_ENABLED = "webhook_alerts_enabled"
 WEBHOOK_ID                  = "smartlife_motion"
 
+# Watchdog tech-alert snooze — ISO datetime string (UTC) the watchdog's own
+# "silent"/"reconnecting"/"still silent" tech alerts stay quiet until, for
+# projects deliberately taken offline (e.g. a site's router unplugged on
+# purpose). Absent/empty = not paused. Motion/SD/other alerts are unaffected.
+CONF_ALERTS_PAUSED_UNTIL = "alerts_paused_until"
+
 # Per-camera animal detection (stored in options as {device_id: {enabled, classes}})
 CONF_CAMERA_ANIMAL_CONFIG = "camera_animal_config"
 CONF_ANIMAL_ENABLED       = "enabled"

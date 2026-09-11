@@ -28,7 +28,7 @@ from typing import Any
 from .ai_client import AIClient
 from .ai_stats import AIStats
 from .camera_api import CameraAPI
-from .const import EVENT_AI_UPDATED
+from .const import CONF_ALERTS_PAUSED_UNTIL, EVENT_AI_UPDATED
 from .notify_helper import send_email
 from .recording_helper import housekeep_recordings, start_recording
 
@@ -964,7 +964,27 @@ class TuyaMQTTBridge:
           died outright → full config-entry reload. Alerts once before reloading.
         - Tier 4: ~15 min after a Tier-3 reload, verify messages resumed. Silent if fixed;
           alerts once if not.
+
+        Skips entirely (no alert, no reconnect/reload attempt) while this entry's
+        "Pause watchdog alerts" option (Configure → Pause watchdog alerts) is set —
+        for a site deliberately taken offline on purpose, reconnect/reload attempts
+        would never succeed anyway, so there's no point running them, not just
+        silencing the emails they'd otherwise send.
         """
+        entry = self._hass.config_entries.async_get_entry(self._entry_id)
+        paused_until_raw = entry.options.get(CONF_ALERTS_PAUSED_UNTIL, "") if entry else ""
+        if paused_until_raw:
+            try:
+                paused_until = datetime.fromisoformat(paused_until_raw)
+            except ValueError:
+                paused_until = None
+            if paused_until and paused_until > datetime.now(timezone.utc):
+                _LOGGER.debug(
+                    "Health check %s: watchdog alerts paused until %s — skipping",
+                    self._entry_label, paused_until.isoformat(),
+                )
+                return
+
         health = self._health_state()
 
         # Tier 4 — verify a previous auto-reload actually fixed things.

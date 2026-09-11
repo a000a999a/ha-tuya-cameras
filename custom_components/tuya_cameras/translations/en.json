@@ -29,7 +29,8 @@
           "edit_ai":         "AI human detection",
           "edit_alerts":     "Motion alert sources",
           "edit_animal":     "Camera animal detection",
-          "edit_recording":  "Local recording on human detection"
+          "edit_recording":  "Local recording on human detection",
+          "edit_pause":      "Pause watchdog alerts (site deliberately offline)"
         }
       },
       "edit_settings": {
@@ -91,6 +92,13 @@
           "recording_duration_s":     "Recording duration",
           "recording_path":           "Storage path (relative to /config/www)",
           "recording_retention_days": "Retention period"
+        }
+      },
+      "edit_pause": {
+        "title": "Pause Watchdog Alerts",
+        "description": "For a site deliberately taken offline on purpose (e.g. its router unplugged) — silences only the self-healing watchdog's own \"silent\"/\"reconnecting\" tech-alert emails for this project. Motion, SD, and other alerts are unaffected. Automatically resumes after the chosen period, or pick Off to resume immediately.\n\n{status}",
+        "data": {
+          "duration_days": "Pause duration"
         }
       }
     },

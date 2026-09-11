@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.core import callback
 from homeassistant.helpers import selector
+from homeassistant.util import dt as dt_util
 
 from .ai_client import AIClient
 from .const import (
     ANIMAL_COCO_CLASSES,
     CONF_AI_ENABLED,
     CONF_AI_URL,
+    CONF_ALERTS_PAUSED_UNTIL,
     CONF_ANIMAL_CLASSES,
     CONF_ANIMAL_ENABLED,
     CONF_CAMERA_ANIMAL_CONFIG,
@@ -159,7 +163,7 @@ class TuyaCamerasOptionsFlow(OptionsFlow):
             step_id="init",
             menu_options=[
                 "edit_recipients", "edit_settings", "edit_ai", "edit_alerts",
-                "edit_animal", "edit_recording",
+                "edit_animal", "edit_recording", "edit_pause",
             ],
         )
 
@@ -297,6 +301,46 @@ class TuyaCamerasOptionsFlow(OptionsFlow):
             step_id="edit_alerts",
             data_schema=schema,
             description_placeholders={"webhook_url": webhook_url},
+        )
+
+    async def async_step_edit_pause(self, user_input: dict | None = None) -> ConfigFlowResult:
+        """Snooze the self-healing watchdog's own tech-alert emails for this
+        project — for a site deliberately taken offline (e.g. its router
+        unplugged on purpose) where the watchdog would otherwise keep firing
+        "silent"/"reconnecting" alerts indefinitely. Only the watchdog's own
+        alerts are affected; motion, SD, and other alerts are untouched."""
+        if user_input is not None:
+            days = int(user_input["duration_days"])
+            new_options = {**self._entry.options, CONF_RECIPIENTS: self._recipients}
+            if days == 0:
+                new_options[CONF_ALERTS_PAUSED_UNTIL] = ""
+            else:
+                new_options[CONF_ALERTS_PAUSED_UNTIL] = (
+                    dt_util.utcnow() + timedelta(days=days)
+                ).isoformat()
+            return self.async_create_entry(data=new_options)
+
+        paused_until_raw = self._entry.options.get(CONF_ALERTS_PAUSED_UNTIL, "")
+        status = "Not currently paused."
+        if paused_until_raw:
+            paused_until = dt_util.parse_datetime(paused_until_raw)
+            if paused_until and paused_until > dt_util.utcnow():
+                status = f"Currently paused until {dt_util.as_local(paused_until).strftime('%Y-%m-%d')}."
+
+        schema = vol.Schema({
+            vol.Required("duration_days", default="0"): selector.SelectSelector(
+                selector.SelectSelectorConfig(options=[
+                    selector.SelectOptionDict(value="0",  label="Off — resume watchdog alerts now"),
+                    selector.SelectOptionDict(value="30", label="Pause for 30 days"),
+                    selector.SelectOptionDict(value="60", label="Pause for 60 days"),
+                    selector.SelectOptionDict(value="90", label="Pause for 90 days"),
+                ])
+            )
+        })
+        return self.async_show_form(
+            step_id="edit_pause",
+            data_schema=schema,
+            description_placeholders={"status": status},
         )
 
     async def async_step_edit_ai(self, user_input: dict | None = None) -> ConfigFlowResult:
