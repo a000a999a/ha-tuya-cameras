@@ -81,6 +81,111 @@ For each area (Tuya home name), configure:
 
 Leave blank to disable alerts for that area.
 
+## Additional options (Settings → Devices & Services → Tuya Cameras → Configure)
+
+Everything below is optional and can be changed any time after initial setup — none
+of it is required to get motion alerts + SD monitoring working.
+
+### General settings
+
+| Field | Default | Description |
+|---|---|---|
+| Device list refresh interval | 14 days | How often the camera/area list is re-pulled from Tuya Cloud |
+| SD card alert threshold | 90% | Usage % that triggers a tech alert email |
+
+### AI Detection (optional — requires [ha-tuya-ai-detection](https://github.com/a000a999a/ha-tuya-ai-detection))
+
+Without this, every motion event emails a human. With it, only events where a human
+is actually detected in the frame get emailed — everything else is discarded
+silently (or sent as a fail-open plain image if the AI service errors).
+
+| Field | Default | Description |
+|---|---|---|
+| Enable AI detection | Off | Filter motion events through the inference service before emailing |
+| Inference service URL | `http://localhost:8000` | Base URL of the running `ha-tuya-ai-detection` service |
+
+Saving validates the URL against the service's `/health` endpoint before accepting it.
+
+### Animal detection (optional, per camera)
+
+Configure per camera, under **Configure → Animal detection → pick a camera**:
+
+| Field | Default | Description |
+|---|---|---|
+| Enable animal detection | Off | Also alert (in addition to human detection) when a configured species is seen |
+| Species | none selected | One or more COCO classes: bird, cat, dog, horse, sheep, cow, elephant, bear, zebra, giraffe — leave empty to match any animal |
+
+Requires AI Detection to be enabled above (same inference service, same COCO model).
+
+### Motion alert sources
+
+| Field | Default | Description |
+|---|---|---|
+| Enable MQTT motion alerts | On | The primary motion path — push events from Tuya's MQTT broker |
+| Enable SmartLife webhook alerts | Off | A secondary path for cameras whose MQTT delivery is unreliable — see below |
+
+Turning MQTT alerts off only skips the *email* — AI stats and snapshots for that
+camera keep recording either way.
+
+#### SmartLife webhook bridge (optional, advanced)
+
+Some camera models deliver Tuya MQTT motion events unreliably even though the
+official SmartLife app's push notifications always fire. The webhook bridge is a
+workaround for exactly those cameras: a small Android app running as a background
+service on a spare Android device (an old phone or tablet works fine, kept
+permanently on Wi-Fi and charging) intercepts SmartLife's own push notifications and
+forwards the captured image to Home Assistant over your local network.
+
+**Only set this up if you have a specific camera with confirmed unreliable MQTT
+delivery.** For every other camera, MQTT alone is simpler and sufficient — and a
+camera that already gets alerts via MQTT is automatically skipped by the webhook
+path if both happen to be enabled, so there's no double-alerting risk in trying it.
+
+1. Enable **SmartLife webhook alerts** above — a webhook URL is shown on that screen
+   (`http://<your-ha-host>/api/webhook/smartlife_motion`); note it, you'll enter it
+   in the app.
+2. Build or obtain the SmartLife Bridge Android app (source alongside this repo) and
+   install it on the spare device via `adb install`.
+3. Open the app once and paste in the webhook URL from step 1, then save.
+4. On the device: **Settings → Apps → SmartLife Bridge → Battery → Unrestricted**
+   (the plain "allow background" toggle alone is not enough — LineageOS and stock
+   Android's battery manager will still kill the service under this setting).
+5. **Settings → Special app access → Notification access → SmartLife Bridge → On.**
+6. **Reboot the device once** after granting notification access — some Android
+   versions require a reboot for the notification listener to actually bind.
+7. Make sure the SmartLife app itself has push notifications enabled for the
+   camera(s) you want covered.
+
+If notifications stop arriving after some time, check that the battery-optimisation
+exemption is still set (some manufacturers' custom Android builds silently reset it
+on OS updates) and that the device still has notification access granted.
+
+### Self-healing MQTT connection
+
+The MQTT bridge (the primary motion-alert path) monitors its own connection health
+and recovers automatically without needing a manual reload, on an escalating
+schedule checked every 5 minutes:
+
+| Condition | Action |
+|---|---|
+| Connected, but no messages for over an hour | Forces a reconnect — fixes a "connected but silent" session (the most common failure mode; recovers most events, no manual step) |
+| Still silent 2 hours in, or disconnected over an hour, or the bridge's own background task died | Fully reloads the integration entry — the same fix an admin would do by hand |
+| ~15 minutes after a forced reload | Checks whether messages resumed; alerts only if they haven't |
+
+You'll get a tech alert email before any reload attempt, and again if a reload
+didn't fix it — never a "recovered successfully" spam email. A reload won't be
+attempted more than once every 6 hours for the same entry, to avoid thrashing; past
+that, you'll get an alert asking for a manual look instead.
+
+This has fired for real in production (not just tested) — the forced-reconnect
+tier specifically. If you see it firing repeatedly for the *same* camera project on
+a recurring schedule rather than as an occasional one-off, that's worth investigating
+as its own issue (a project reconnecting cleanly once and then staying silent again
+within the hour points at something upstream — session/credential handling or
+network path — rather than a problem this watchdog itself can fix; it will keep
+nudging it back each time either way, so alerts won't go unnoticed, but it isn't a
+substitute for finding the root cause).
+
 ## Refresh All Cameras
 
 A single service call `tuya_cameras.refresh_all` refreshes all projects and updates
