@@ -384,8 +384,8 @@ def _patch_cameras_view(view: dict, cam_info: dict) -> bool:
     # untitled placeholder section instead of the one existing section that
     # already represents their project. Deliberately narrow: only relocates
     # cards out of a section whose heading is blank/missing. A section with
-    # any real heading text (e.g. a user manually split "Farm" out of
-    # "Winterthur") is never touched — manual dashboard organisation always
+    # any real heading text (e.g. a user manually split "Garage" out of
+    # "Main Home") is never touched — manual dashboard organisation always
     # wins over this heuristic, even when both sections map to the same
     # underlying Tuya project.
     sections = view.get("sections", [])
@@ -812,7 +812,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Health check runs on HA's own core timer, not a bridge-managed task — deliberately
     # external so it keeps checking even if the bridge's own background task hangs or dies
-    # (see check_health()'s docstring for why: this is exactly what happened to Brasil's
+    # (see check_health()'s docstring for why: this is exactly what happened to one project's
     # bridge on 2026-08-27, and nothing noticed for ~8 hours).
     #
     # Must be @callback: an undecorated function here gets dispatched via HA's executor

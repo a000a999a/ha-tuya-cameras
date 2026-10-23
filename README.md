@@ -288,6 +288,6 @@ BizCode subscriptions are active.
 **Emails not sending:** Gmail requires an App Password — regular password won't work.
 Enable 2FA first, then create an App Password at myaccount.google.com.
 
-**Wallis / new cameras show no SD or status:** Press **Refresh All Cameras**. If still
+**New cameras show no SD or status:** Press **Refresh All Cameras**. If still
 empty, the camera name in SmartLife must match the picture-glance card title exactly
 (case-insensitive) for automatic entity wiring.

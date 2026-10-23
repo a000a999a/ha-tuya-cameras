@@ -41,7 +41,7 @@ WATCHDOG_CHECK_S          = 300    # health check runs every 5 min (driven exter
 # Tier 2 — gentle forced-reconnect nudge while connected but quiet (fixes stale/IPv6 sessions).
 NUDGE_SILENCE_CONN_S      = 3600   # 1 h connected-but-silent → forced reconnect nudge
 
-# Tier 3 — full config-entry reload (2026-08-28: escalation added after Brasil's bridge task
+# Tier 3 — full config-entry reload (2026-08-28: escalation added after one project's bridge task
 # silently died and never recovered on its own — a dead/hung task needs an outside actor to
 # notice and restart it; the in-loop retry in _run() can't save itself if the loop is gone).
 RELOAD_SILENCE_S          = 3600   # 1 h DISCONNECTED → reload (no nudge tier; a stuck in-loop
@@ -448,7 +448,7 @@ class TuyaMQTTBridge:
                 file_key  = parts[1] if len(parts) > 1 else ""
                 if "?param=" in file_path and not file_key:
                     # Signed CDN URL — confirmed blocked (403) for all cameras tested:
-                    # Brasil CDN (IP-restricted to Brazil) and EU Camera Door both return 403.
+                    # a region-locked CDN (IP-restricted to its home country) and an EU camera both return 403.
                     # Spending ~1.5s on two failing HTTP calls only delays the RTSP snapshot.
                     # Skip CDN and go straight to snapshot.
                     _LOGGER.debug("Motion %s/%s: signed CDN URL — skipping (known 403), going direct to snapshot", area, name)
@@ -511,7 +511,7 @@ class TuyaMQTTBridge:
                     break
                 if attempt == last_attempt:
                     # All attempts exhausted — check for stale RTSP frame before discarding.
-                    # Applies universally: Brasil v4.0, Brasil ?param=, Wallis, Camera Door —
+                    # Applies universally: v4.0 blobs, signed ?param= URLs, plain snapshot-only cameras —
                     # any camera that ends up in the snapshot path can hit this.
                     # Threshold ≥2 so a single failed snapshot doesn't mask the stale condition.
                     if len(snap_hashes) >= 2 and len(set(snap_hashes)) == 1:
@@ -783,7 +783,7 @@ class TuyaMQTTBridge:
     async def handle_external_motion(self, area: str, name: str, camera_entity_id: str) -> None:
         """Handle a motion event from a non-Tuya-MQTT source.
 
-        Added 2026-08-31 for ONVIF-based cameras (specifically Winti Terrasse, whose
+        Added 2026-08-31 for ONVIF-based cameras (specifically a cdsxj camera, whose
         Tuya cloud/MQTT path is permanently broken — see the cdsxj product-template
         break in project memory) — HA's native ONVIF integration provides a genuine
         binary_sensor for motion, and an automation calls the tuya_cameras.handle_

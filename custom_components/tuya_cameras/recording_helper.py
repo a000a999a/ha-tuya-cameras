@@ -41,8 +41,8 @@ __init__.py directly). A brand-new connection to Tuya's RTSP relay doesn't
 guarantee a stable timestamp base from frame one; the muxer aborts outright
 if it isn't. Starting a live view (e.g. opening the camera on the HA
 dashboard) before triggering a recording reliably avoided the same failure
-(confirmed working: the one fully successful recording so far, Winti
-Terrasse via ONVIF, went through an already-live connection, not a cold
+(confirmed working: the one fully successful recording so far, an ONVIF
+camera, went through an already-live connection, not a cold
 one). So start_recording() now pre-warms the same cached Stream itself —
 calling camera.async_create_stream() and giving it a few seconds — before
 calling the camera.record service, so the record call reuses an

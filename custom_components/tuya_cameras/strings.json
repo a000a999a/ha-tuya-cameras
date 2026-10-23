@@ -55,7 +55,7 @@
       },
       "edit_alerts": {
         "title": "Configure MQTT vs Android App Webhook",
-        "description": "MQTT: low-latency push from Tuya cloud — always active for all cameras.\nSmartLife webhook: direct capture image from the SmartLife app on your tablet — better image timing for Brasil cameras.\n\nWebhook URL for the Android bridge app:\n{webhook_url}",
+        "description": "MQTT: low-latency push from Tuya cloud — always active for all cameras.\nSmartLife webhook: direct capture image from the SmartLife app on your tablet — better image timing for cameras with unreliable MQTT delivery.\n\nWebhook URL for the Android bridge app:\n{webhook_url}",
         "data": {
           "mqtt_alerts_enabled":    "Enable MQTT motion alerts",
           "webhook_alerts_enabled": "Enable SmartLife webhook alerts (requires Android bridge app)"

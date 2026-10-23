@@ -17,3 +17,6 @@ secrets.yaml
 dist/
 *.egg-info/
 android/*.apk
+
+# Local Claude Code notes — never publish
+CLAUDE.md

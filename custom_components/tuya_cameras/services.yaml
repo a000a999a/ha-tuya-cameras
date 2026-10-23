@@ -28,16 +28,16 @@ handle_onvif_motion:
         text: {}
     area:
       name: Area
-      description: Area name, matching this entry's configured recipients (e.g. "Winterthur").
+      description: Area name, matching this entry's configured recipients (e.g. "Main Home").
       required: true
-      example: "Winterthur"
+      example: "Main Home"
       selector:
         text: {}
     name:
       name: Camera name
       description: Display name for this camera, used in the email subject/body.
       required: true
-      example: "Winti Terrasse"
+      example: "Garden Terrace"
       selector:
         text: {}
     camera_entity_id:
