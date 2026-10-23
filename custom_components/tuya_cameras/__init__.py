@@ -780,10 +780,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     }
 
     # Start global webhook bridge if any entry has it enabled and it isn't running yet
+    # (stored before the await so a concurrently set-up entry can't register it twice)
     if webhook_enabled and "_webhook" not in domain_data:
         wb = SmartLifeWebhookBridge(hass)
-        wb.start()
         domain_data["_webhook"] = wb
+        await wb.async_start()
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))

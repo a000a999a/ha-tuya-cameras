@@ -52,7 +52,10 @@ EVENT_AI_UPDATED = f"{DOMAIN}_ai_updated"
 # Motion alert source toggles
 CONF_MQTT_ALERTS_ENABLED    = "mqtt_alerts_enabled"
 CONF_WEBHOOK_ALERTS_ENABLED = "webhook_alerts_enabled"
-WEBHOOK_ID                  = "smartlife_motion"
+# The SmartLife webhook ID is the webhook's only secret (HA webhooks carry no auth),
+# so it is generated randomly once per install and persisted — never hardcoded.
+WEBHOOK_STORAGE_KEY         = f"{DOMAIN}_webhook"
+WEBHOOK_STORAGE_VERSION     = 1
 
 # Watchdog tech-alert snooze — ISO datetime string (UTC) the watchdog's own
 # "silent"/"reconnecting"/"still silent" tech alerts stay quiet until, for

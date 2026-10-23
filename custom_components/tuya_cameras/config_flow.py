@@ -21,7 +21,6 @@ from .const import (
     CONF_CAMERA_ANIMAL_CONFIG,
     CONF_MQTT_ALERTS_ENABLED,
     CONF_WEBHOOK_ALERTS_ENABLED,
-    WEBHOOK_ID,
     CONF_CORE_ENTRY_ID,
     CONF_HUMAN_RECIPIENTS,
     CONF_RECIPIENTS,
@@ -41,6 +40,7 @@ from .const import (
     DOMAIN,
     DOMAIN_CORE,
 )
+from .webhook_bridge import async_get_webhook_id, webhook_url
 
 
 # Notify-target selectors, scoped to the SMTP integration specifically — the
@@ -284,12 +284,7 @@ class TuyaCamerasOptionsFlow(OptionsFlow):
         mqtt_on    = self._entry.options.get(CONF_MQTT_ALERTS_ENABLED, True)
         webhook_on = self._entry.options.get(CONF_WEBHOOK_ALERTS_ENABLED, False)
 
-        try:
-            from homeassistant.helpers.network import get_url
-            base = get_url(self.hass, prefer_internal=True)
-        except Exception:
-            base = "http://homeassistant.local:8123"
-        webhook_url = f"{base.rstrip('/')}/api/webhook/{WEBHOOK_ID}"
+        url = webhook_url(self.hass, await async_get_webhook_id(self.hass))
 
         schema = vol.Schema({
             vol.Optional(CONF_MQTT_ALERTS_ENABLED, default=mqtt_on):
@@ -300,7 +295,7 @@ class TuyaCamerasOptionsFlow(OptionsFlow):
         return self.async_show_form(
             step_id="edit_alerts",
             data_schema=schema,
-            description_placeholders={"webhook_url": webhook_url},
+            description_placeholders={"webhook_url": url},
         )
 
     async def async_step_edit_pause(self, user_input: dict | None = None) -> ConfigFlowResult:

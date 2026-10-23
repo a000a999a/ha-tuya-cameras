@@ -7,10 +7,50 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from .const import DOMAIN, WEBHOOK_ID
+from homeassistant.helpers.storage import Store
+
+from .const import DOMAIN, WEBHOOK_STORAGE_KEY, WEBHOOK_STORAGE_VERSION
 from .notify_helper import send_email
 
 _LOGGER = logging.getLogger(__name__)
+
+# hass.data keys — kept outside hass.data[DOMAIN], whose values are per-entry dicts
+_WEBHOOK_ID_KEY   = f"{DOMAIN}_webhook_id"
+_WEBHOOK_LOCK_KEY = f"{DOMAIN}_webhook_id_lock"
+
+
+async def async_get_webhook_id(hass: Any) -> str:
+    """Return this install's webhook ID, generating and persisting a random one on first use.
+
+    Shared by the bridge (registration) and the options flow (showing the URL), so the
+    lock keeps two concurrent first calls from generating two different IDs.
+    """
+    if webhook_id := hass.data.get(_WEBHOOK_ID_KEY):
+        return webhook_id
+    lock = hass.data.setdefault(_WEBHOOK_LOCK_KEY, asyncio.Lock())
+    async with lock:
+        if webhook_id := hass.data.get(_WEBHOOK_ID_KEY):
+            return webhook_id
+        store  = Store(hass, WEBHOOK_STORAGE_VERSION, WEBHOOK_STORAGE_KEY)
+        stored = await store.async_load() or {}
+        webhook_id = stored.get("webhook_id")
+        if not webhook_id:
+            from homeassistant.components import webhook
+            webhook_id = webhook.async_generate_id()
+            await store.async_save({"webhook_id": webhook_id})
+            _LOGGER.info("SmartLife webhook: generated a new random webhook ID")
+        hass.data[_WEBHOOK_ID_KEY] = webhook_id
+        return webhook_id
+
+
+def webhook_url(hass: Any, webhook_id: str) -> str:
+    """Full LAN URL the Android bridge app must POST to."""
+    try:
+        from homeassistant.helpers.network import get_url
+        base = get_url(hass, prefer_internal=True)
+    except Exception:
+        base = "http://homeassistant.local:8123"
+    return f"{base.rstrip('/')}/api/webhook/{webhook_id}"
 
 
 def _check_animal_cfg(animal_cfg: dict, dev_id: str | None, ai_result: dict | None) -> str | None:
@@ -29,21 +69,31 @@ def _check_animal_cfg(animal_cfg: dict, dev_id: str | None, ai_result: dict | No
 class SmartLifeWebhookBridge:
     def __init__(self, hass: Any) -> None:
         self._hass = hass
+        self._webhook_id: str | None = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
-    def start(self) -> None:
+    async def async_start(self) -> None:
         from homeassistant.components import webhook
+        self._webhook_id = await async_get_webhook_id(self._hass)
+        # local_only: the Android bridge always posts over the LAN, so requests from
+        # outside (Nabu Casa, port forward, reverse proxy) are rejected even if the ID leaks.
         webhook.async_register(
             self._hass, DOMAIN, "SmartLife Motion Bridge",
-            WEBHOOK_ID, self._handle,
+            self._webhook_id, self._handle,
+            local_only=True, allowed_methods=["POST"],
         )
-        _LOGGER.info("SmartLife webhook bridge registered — POST to /api/webhook/%s", WEBHOOK_ID)
+        _LOGGER.info(
+            "SmartLife webhook bridge registered — enter this URL in the Android bridge app: %s",
+            webhook_url(self._hass, self._webhook_id),
+        )
 
     def stop(self) -> None:
         from homeassistant.components import webhook
+        if not self._webhook_id:
+            return
         try:
-            webhook.async_unregister(self._hass, WEBHOOK_ID)
+            webhook.async_unregister(self._hass, self._webhook_id)
         except Exception:
             pass
         _LOGGER.info("SmartLife webhook bridge unregistered")

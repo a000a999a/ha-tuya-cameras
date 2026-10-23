@@ -141,9 +141,11 @@ delivery.** For every other camera, MQTT alone is simpler and sufficient — and
 camera that already gets alerts via MQTT is automatically skipped by the webhook
 path if both happen to be enabled, so there's no double-alerting risk in trying it.
 
-1. Enable **SmartLife webhook alerts** above — a webhook URL is shown on that screen
-   (`http://<your-ha-host>/api/webhook/smartlife_motion`); note it, you'll enter it
-   in the app.
+1. Enable **SmartLife webhook alerts** above — the webhook URL is shown on that screen
+   (`http://<your-ha-host>:8123/api/webhook/<random-id>`, also logged at INFO when the
+   bridge starts); note it, you'll enter it in the app. The ID is generated randomly
+   once per install and is the webhook's only secret, so don't share it. The webhook
+   only accepts POSTs from your local network.
 2. Build or obtain the SmartLife Bridge Android app (source alongside this repo) and
    install it on the spare device via `adb install`.
 3. Open the app once and paste in the webhook URL from step 1, then save.
@@ -155,6 +157,12 @@ path if both happen to be enabled, so there's no double-alerting risk in trying 
    versions require a reboot for the notification listener to actually bind.
 7. Make sure the SmartLife app itself has push notifications enabled for the
    camera(s) you want covered.
+
+**Upgrading from 0.11.x:** the webhook used to live at the fixed address
+`/api/webhook/smartlife_motion`. From 0.12.0 it has a random ID instead, and the old
+address no longer works. After upgrading, open **Configure → Motion alert sources**,
+copy the new URL and paste it into the SmartLife Bridge app on the device. Until you
+do, webhook alerts stop arriving (MQTT alerts are unaffected).
 
 If notifications stop arriving after some time, check that the battery-optimisation
 exemption is still set (some manufacturers' custom Android builds silently reset it
