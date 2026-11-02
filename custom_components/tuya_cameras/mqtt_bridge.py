@@ -748,7 +748,7 @@ class TuyaMQTTBridge:
     def _get_recipients(self, area: str, kind: str) -> list[str]:
         """Notify entity IDs configured for this area/kind (list already, from
         the config flow's multi-select EntitySelector — no parsing needed)."""
-        return list(self._recipients_cfg.get(area, {}).get(kind, []))
+        return list(self._recipients_cfg.get(area.strip(), {}).get(kind, []))
 
     async def _maybe_record(self, area: str, name: str, camera_entity_id: str | None) -> None:
         """Start a local recording if enabled — called only after a human has
@@ -1070,13 +1070,6 @@ class TuyaMQTTBridge:
             _LOGGER.info(
                 "Health check heal: forced reconnect for %s after %.0f min silence",
                 self._entry_label, silence / 60,
-            )
-            await self._send_tech_alert(
-                f"MQTT bridge silent — {self._entry_label} — reconnecting",
-                f"No MQTT messages for {silence / 60:.0f} minutes (connected but silent). "
-                f"Forcing reconnect to heal potential stale session (e.g. IPv6 stuck). "
-                f"If events resume, the session was stale. If still silent after "
-                f"{RELOAD_SILENCE_CONN_S / 3600:.0f} h total, this will reload automatically.",
             )
 
     @staticmethod

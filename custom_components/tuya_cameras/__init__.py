@@ -811,6 +811,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     bridge.start(hass)
 
+    # Warn immediately at startup if any known camera has no human recipients — a
+    # mismatch between the stored recipient area key and the live area name (e.g. a
+    # trailing-space difference after an HA area rename) would otherwise only surface
+    # when a human is actually detected, which can be hours or days later.
+    cam_map = (coordinator.data or {}).get("cameras", {})
+    for cam in cam_map.values():
+        cam_area = (cam.get("area") or "").strip()
+        if cam_area and not recipients.get(cam_area, {}).get("human"):
+            _LOGGER.warning(
+                "Camera '%s' is in area '%s' but no human-alert recipients are configured "
+                "for that area — motion alerts will be silently dropped. "
+                "Go to Configure → Edit recipients to fix this.",
+                cam.get("name", "?"), cam_area,
+            )
+
     # Health check runs on HA's own core timer, not a bridge-managed task — deliberately
     # external so it keeps checking even if the bridge's own background task hangs or dies
     # (see check_health()'s docstring for why: this is exactly what happened to one project's
