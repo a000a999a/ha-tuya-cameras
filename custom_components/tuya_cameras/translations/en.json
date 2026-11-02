@@ -91,7 +91,8 @@
           "recording_enabled":        "Enable local recording",
           "recording_duration_s":     "Recording duration",
           "recording_path":           "Storage path (relative to /config/www)",
-          "recording_retention_days": "Retention period"
+          "recording_retention_days": "Recording retention period",
+          "snapshot_retention_days":  "Debug snapshot retention period"
         }
       },
       "edit_pause": {

@@ -85,6 +85,7 @@ class TuyaMQTTBridge:
         recording_duration_s: int = 60,
         recording_path: str = "tuya_cameras/recordings",
         recording_retention_days: int = 7,
+        snapshot_retention_days: int = 7,
     ) -> None:
         self._hass           = hass
         self._entry_id       = entry_id
@@ -104,6 +105,7 @@ class TuyaMQTTBridge:
         self._recording_duration_s     = recording_duration_s
         self._recording_path           = recording_path
         self._recording_retention_days = recording_retention_days
+        self._snapshot_retention_days  = snapshot_retention_days
         self._task: asyncio.Task | None = None
         self._local_keys: dict[str, str] = {}    # device_id → local_key
         self._product_ids: dict[str, str] = {}  # device_id → product_id (for v4 blob decrypt)
@@ -773,11 +775,19 @@ class TuyaMQTTBridge:
         and debug snapshots. Called on a 6 h schedule from __init__.py.
         Snapshot cleanup runs unconditionally; recording cleanup only when enabled.
         """
-        deleted = await self._hass.async_add_executor_job(
-            housekeep_snapshots, self._hass,
-        )
-        if deleted:
-            _LOGGER.info("Snapshot housekeeping: %d debug snapshot(s) deleted", deleted)
+        try:
+            deleted = await self._hass.async_add_executor_job(
+                housekeep_snapshots, self._hass, self._snapshot_retention_days,
+            )
+            if deleted:
+                _LOGGER.info("Snapshot housekeeping: %d debug snapshot(s) deleted", deleted)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Snapshot housekeeping failed: %s", err)
+            await self._send_tech_alert(
+                "Snapshot housekeeping failed",
+                f"Failed to clean up debug snapshots: {err}. "
+                f"Check /config/debug_snapshots/ for accumulation.",
+            )
 
         if not self._recording_enabled:
             return

@@ -31,12 +31,14 @@ from .const import (
     CONF_RECORDING_DURATION_S,
     CONF_RECORDING_PATH,
     CONF_RECORDING_RETENTION_DAYS,
+    CONF_SNAPSHOT_RETENTION_DAYS,
     DEFAULT_AI_URL,
     DEFAULT_REFRESH_DAYS,
     DEFAULT_SD_ALERT_THRESHOLD,
     DEFAULT_RECORDING_DURATION_S,
     DEFAULT_RECORDING_PATH,
     DEFAULT_RECORDING_RETENTION_DAYS,
+    DEFAULT_SNAPSHOT_RETENTION_DAYS,
     DOMAIN,
     DOMAIN_CORE,
 )
@@ -176,6 +178,7 @@ class TuyaCamerasOptionsFlow(OptionsFlow):
                 CONF_RECORDING_DURATION_S:       int(user_input[CONF_RECORDING_DURATION_S]),
                 CONF_RECORDING_PATH:             user_input[CONF_RECORDING_PATH].strip("/"),
                 CONF_RECORDING_RETENTION_DAYS:   int(user_input[CONF_RECORDING_RETENTION_DAYS]),
+                CONF_SNAPSHOT_RETENTION_DAYS:    int(user_input[CONF_SNAPSHOT_RETENTION_DAYS]),
             }
             return self.async_create_entry(data=new_options)
 
@@ -197,6 +200,13 @@ class TuyaCamerasOptionsFlow(OptionsFlow):
                          default=o.get(CONF_RECORDING_RETENTION_DAYS, DEFAULT_RECORDING_RETENTION_DAYS)):
                 selector.NumberSelector(selector.NumberSelectorConfig(
                     min=1, max=90, step=1,
+                    mode=selector.NumberSelectorMode.BOX,
+                    unit_of_measurement="days",
+                )),
+            vol.Optional(CONF_SNAPSHOT_RETENTION_DAYS,
+                         default=o.get(CONF_SNAPSHOT_RETENTION_DAYS, DEFAULT_SNAPSHOT_RETENTION_DAYS)):
+                selector.NumberSelector(selector.NumberSelectorConfig(
+                    min=1, max=30, step=1,
                     mode=selector.NumberSelectorMode.BOX,
                     unit_of_measurement="days",
                 )),

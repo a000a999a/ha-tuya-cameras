@@ -25,7 +25,9 @@ from .const import (
     CONF_MQTT_ALERTS_ENABLED, CONF_WEBHOOK_ALERTS_ENABLED,
     CONF_RECORDING_ENABLED, CONF_RECORDING_DURATION_S,
     CONF_RECORDING_PATH, CONF_RECORDING_RETENTION_DAYS,
+    CONF_SNAPSHOT_RETENTION_DAYS,
     DEFAULT_RECORDING_DURATION_S, DEFAULT_RECORDING_PATH, DEFAULT_RECORDING_RETENTION_DAYS,
+    DEFAULT_SNAPSHOT_RETENTION_DAYS,
     DOMAIN, DOMAIN_CORE,
 )
 from .coordinator import CameraCoordinator
@@ -746,6 +748,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     recording_duration_s     = entry.options.get(CONF_RECORDING_DURATION_S, DEFAULT_RECORDING_DURATION_S)
     recording_path           = entry.options.get(CONF_RECORDING_PATH, DEFAULT_RECORDING_PATH)
     recording_retention_days = entry.options.get(CONF_RECORDING_RETENTION_DAYS, DEFAULT_RECORDING_RETENTION_DAYS)
+    snapshot_retention_days  = entry.options.get(CONF_SNAPSHOT_RETENTION_DAYS, DEFAULT_SNAPSHOT_RETENTION_DAYS)
 
     bridge = TuyaMQTTBridge(
         hass           = hass,
@@ -766,6 +769,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         recording_duration_s     = recording_duration_s,
         recording_path           = recording_path,
         recording_retention_days = recording_retention_days,
+        snapshot_retention_days  = snapshot_retention_days,
     )
 
     domain_data = hass.data.setdefault(DOMAIN, {})
