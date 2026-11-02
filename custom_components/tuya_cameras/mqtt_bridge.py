@@ -30,7 +30,7 @@ from .ai_stats import AIStats
 from .camera_api import CameraAPI
 from .const import CONF_ALERTS_PAUSED_UNTIL, EVENT_AI_UPDATED
 from .notify_helper import send_email
-from .recording_helper import housekeep_recordings, start_recording
+from .recording_helper import housekeep_recordings, housekeep_snapshots, start_recording
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -769,10 +769,16 @@ class TuyaMQTTBridge:
         )
 
     async def run_housekeeping(self) -> None:
-        """Retention-based cleanup + low-disk-space check/prune for recordings.
-        Called on a schedule from __init__.py — see async_track_time_interval
-        registration there. No-op if recording was never enabled for this entry.
+        """Retention-based cleanup + low-disk-space check/prune for recordings
+        and debug snapshots. Called on a 6 h schedule from __init__.py.
+        Snapshot cleanup runs unconditionally; recording cleanup only when enabled.
         """
+        deleted = await self._hass.async_add_executor_job(
+            housekeep_snapshots, self._hass,
+        )
+        if deleted:
+            _LOGGER.info("Snapshot housekeeping: %d debug snapshot(s) deleted", deleted)
+
         if not self._recording_enabled:
             return
         await housekeep_recordings(

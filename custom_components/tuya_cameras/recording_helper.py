@@ -268,3 +268,21 @@ async def housekeep_recordings(
             f"oldest recording(s) to free space. Consider shortening the retention period or "
             f"recording duration, or freeing disk space on this volume.",
         )
+
+
+def housekeep_snapshots(hass: HomeAssistant, retention_days: int = 7) -> int:
+    """Delete debug snapshot files older than retention_days. Returns count deleted.
+    Blocking — run in the executor."""
+    snap_dir = Path(hass.config.path("debug_snapshots"))
+    if not snap_dir.exists():
+        return 0
+    cutoff = time.time() - retention_days * 86400
+    deleted = 0
+    for f in snap_dir.glob("snap_*.jpg"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+                deleted += 1
+        except OSError:
+            pass
+    return deleted
