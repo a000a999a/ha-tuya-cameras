@@ -86,11 +86,11 @@
       },
       "edit_recording": {
         "title": "Local Recording",
-        "description": "Records a local video clip when a human is confirmed (never on raw/unfiltered motion, so a false positive never burns a clip). Applies to both the MQTT and ONVIF motion paths. Housekeeping (retention cleanup + low-disk-space pruning) runs automatically on its own schedule. Recordings are stored under /config/www — the only local path Home Assistant's camera.record service allows writing to without extra configuration.yaml setup, and it lives on real, host-persistent storage without requiring any extra Docker volume.",
+        "description": "Records a local video clip when a human is confirmed (never on raw/unfiltered motion, so a false positive never burns a clip). Applies to both the MQTT and ONVIF motion paths. Housekeeping (retention cleanup + low-disk-space pruning) runs automatically on its own schedule. Recordings are stored under /config/media — visible in the HA Media Browser (Media → Local media) with thumbnail previews and in-browser playback.",
         "data": {
           "recording_enabled":        "Enable local recording",
           "recording_duration_s":     "Recording duration",
-          "recording_path":           "Storage path (relative to /config/www)",
+          "recording_path":           "Storage path (relative to /config/media)",
           "recording_retention_days": "Recording retention period",
           "snapshot_retention_days":  "Debug snapshot retention period"
         }

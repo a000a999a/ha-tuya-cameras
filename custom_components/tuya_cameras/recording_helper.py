@@ -7,27 +7,18 @@ not on raw/unfiltered motion, so a false positive (wind, shadows, an animal) nev
 burns a full recording. Video is referenced by its saved path in the alert email,
 never attached (large files, most mail clients don't render video inline).
 
-Storage root: unlike notify_helper's motion-image attachments (which must live
-under hass.config.media_dirs["local"] because they're referenced via a
-media-source:// URI that HA resolves against that root), recordings are only
-ever referenced by plain filesystem path in the alert email text — no
-media-source resolution needed. So in principle any writable directory would
-do — EXCEPT that HA's own camera.record service enforces its own security
-allowlist independent of filesystem permissions: `stream.async_record()`
-rejects any target path not under `hass.config.allowlist_external_dirs`.
-Confirmed directly from HA core (core_config.py):
+Storage root: recordings are stored under hass.config.path("media", path_root)
+(/config/media/<path_root> inside the container). HA's camera.record service
+enforces a security allowlist (stream.async_record() rejects paths outside it):
 
     hac.allowlist_external_dirs = {hass.config.path("www"), *hac.media_dirs.values()}
 
-i.e. exactly two locations are allowed with zero extra configuration: the
-media root (media_dirs["local"], which on a Docker install defaults to /media
-and is typically NOT host-mounted — the original problem) and <config>/www/.
-Recordings are therefore stored under hass.config.path("www", path_root) —
-always allowlisted with no configuration.yaml edit needed, and still under
-the already-persistent /config bind mount on every HA install type (Docker,
-HAOS, Supervised, Core). Confirmed live 2026-09-01: writing directly under
-/config (outside www/) raises `HomeAssistantError: Can't write ..., no access
-to path!` even though the directory itself is writable.
+media_dirs["local"] resolves to /config/media on this Docker install (the
+entire /config is bind-mounted to the host), so /config/media is already on
+the allowlist with no configuration.yaml changes needed. Using /config/media
+instead of /config/www means recordings appear in HA's native Media Browser
+(Media sidebar → Local media) with thumbnail previews and in-browser playback.
+Confirmed live 2026-11-03: /config/media is host-persistent and allowlisted.
 
 Stream warm-up: confirmed live 2026-09-01 on two separate Tuya-cloud-relayed
 cameras (Camera Door, Panorama Camera escadas) that calling camera.record
@@ -112,10 +103,8 @@ RTSP_REFRESH_WAIT_S = 15
 
 
 def _recordings_root(hass: HomeAssistant, path_root: str) -> Path:
-    """Root directory for a given recording_path config value, under /config/www —
-    see the module docstring for why this differs from notify_helper's media root.
-    """
-    return Path(hass.config.path("www", path_root))
+    """Root directory for a given recording_path config value, under /config/media."""
+    return Path(hass.config.path("media", path_root))
 
 
 def _safe_slug(text: str) -> str:
