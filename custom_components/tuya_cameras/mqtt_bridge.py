@@ -758,17 +758,28 @@ class TuyaMQTTBridge:
         background task, not awaited inline: start_recording() now pre-warms the
         camera's stream for a few seconds before recording (see recording_helper.py
         "Stream warm-up"), which must never delay the alert email that follows this
-        call at both call sites. Failures are logged and swallowed either way — a
-        recording problem must never affect whether the alert email itself gets sent.
+        call at both call sites. start_recording() failures no longer swallowed silently:
+        a None return triggers a tech alert so a stuck or broken camera stream is visible.
         """
         if not self._recording_enabled or not camera_entity_id:
             return
-        self._hass.async_create_task(
-            start_recording(
+
+        async def _record_and_alert() -> None:
+            result = await start_recording(
                 self._hass, camera_entity_id, area, name,
                 self._recording_duration_s, self._recording_path,
             )
-        )
+            if result is None:
+                await self._send_tech_alert(
+                    f"Recording failed — {area} — {name}",
+                    f"A recording was triggered for {name} in {area} after a human was confirmed, "
+                    f"but it could not be started. The camera's RTSP stream may be stuck (a prior "
+                    f"failed recording left it wedged) or its signed URL may have been stale. "
+                    f"This motion event has no recording. If this repeats, reload the camera's "
+                    f"config entry in HA to un-stick the stream.",
+                )
+
+        self._hass.async_create_task(_record_and_alert())
 
     async def run_housekeeping(self) -> None:
         """Retention-based cleanup + low-disk-space check/prune for recordings
