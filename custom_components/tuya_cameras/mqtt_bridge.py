@@ -432,6 +432,7 @@ class TuyaMQTTBridge:
         img_bytes     = None
         snap_note     = ""
         prefetched_ai: dict | None = None
+        burst_images: list[bytes] = []  # every human-confirmed snapshot frame, for the email
         # Resolved unconditionally (not just in the snapshot-fallback branch below) —
         # recording needs the camera entity regardless of whether the image itself
         # came from OSS or a live snapshot.
@@ -470,14 +471,18 @@ class TuyaMQTTBridge:
         if not img_bytes:
             _LOGGER.debug("Motion %s/%s: no OSS image — trying HA snapshot(s)", area, name)
             snap_hashes: list[str] = []
-            last_attempt = len(SNAPSHOT_RETRY_DELAYS_S) - 1
+            last_snap: bytes | None = None
             for attempt, delay in enumerate(SNAPSHOT_RETRY_DELAYS_S):
                 if delay:
                     await asyncio.sleep(delay)
                 snap = await self._get_ha_snapshot(dev_id, cam_entity_id)
                 if not snap:
-                    _LOGGER.debug("Motion %s/%s: snapshot %d/3 failed", area, name, attempt + 1)
+                    _LOGGER.debug(
+                        "Motion %s/%s: snapshot %d/%d failed",
+                        area, name, attempt + 1, len(SNAPSHOT_RETRY_DELAYS_S),
+                    )
                     continue
+                last_snap = snap
                 snap_hashes.append(hashlib.md5(snap).hexdigest())
                 snap_age  = age_s + delay
                 snap_note = f"live snapshot ({snap_age:.0f}s after event — person may have left)"
@@ -500,60 +505,66 @@ class TuyaMQTTBridge:
 
                 result = await self._ai_client.analyze(snap)
                 if result is None:
-                    # AI unavailable — fail-open with this snapshot
+                    # AI unavailable — fail-open with this snapshot (single image)
                     img_bytes = snap
                     break
+                # Burst: no early exit on a human — run every scheduled snapshot through AI
+                # and keep each confirmed frame, so the email shows the movement sequence.
                 if result["human"]:
-                    img_bytes = snap
-                    prefetched_ai = result
+                    burst_images.append(result.get("annotated_image", snap))
+                    if img_bytes is None:
+                        img_bytes     = snap
+                        prefetched_ai = result
                     _LOGGER.debug(
-                        "Motion %s/%s: human found at +%.1fs (conf=%.2f)",
+                        "Motion %s/%s: human at +%.1fs (conf=%.2f) — %d frame(s) collected",
+                        area, name, delay, result["confidence"], len(burst_images),
+                    )
+                else:
+                    _LOGGER.debug(
+                        "Motion %s/%s: no human at +%.1fs (conf=%.2f)",
                         area, name, delay, result["confidence"],
                     )
-                    break
-                if attempt == last_attempt:
-                    # All attempts exhausted — check for stale RTSP frame before discarding.
-                    # Applies universally: v4.0 blobs, signed ?param= URLs, plain snapshot-only cameras —
-                    # any camera that ends up in the snapshot path can hit this.
+            else:
+                # Loop ran to the end (AI mode). img_bytes set ⇒ ≥1 confirmed frame, fall through.
+                if not snap_hashes:
+                    _LOGGER.warning(
+                        "Motion %s/%s: no image available (OSS failed + all snapshots failed) — event discarded",
+                        area, name,
+                    )
+                    _log_latency("no_image")
+                    return
+                if img_bytes is None:
+                    # No human in any frame — check for a stale RTSP frame before discarding.
+                    # Applies universally: v4.0 blobs, signed ?param= URLs, plain snapshot-only cameras.
                     # Threshold ≥2 so a single failed snapshot doesn't mask the stale condition.
+                    heal_result = None
                     if len(snap_hashes) >= 2 and len(set(snap_hashes)) == 1:
                         _LOGGER.warning(
-                            "Motion %s/%s: all 3 snapshots identical (md5=%s) — RTSP stream serving stale frame",
-                            area, name, snap_hashes[0],
+                            "Motion %s/%s: all %d snapshots identical (md5=%s) — RTSP stream serving stale frame",
+                            area, name, len(snap_hashes), snap_hashes[0],
                         )
                         await self._send_tech_alert(
                             f"Stale RTSP — {area}/{name}",
                             f"Motion at <b>{name}</b> ({area}) at {ev_ts}.<br><br>"
-                            f"{len(snap_hashes)} of 3 snapshots were byte-for-byte identical — "
-                            f"RTSP stream is buffering a stale pre-event frame "
+                            f"{len(snap_hashes)} of {len(SNAPSHOT_RETRY_DELAYS_S)} snapshots were "
+                            f"byte-for-byte identical — RTSP stream is buffering a stale pre-event frame "
                             f"(Tuya token expiry window). Attempting autonomous heal "
                             f"(update_entity → 15 s reconnect → retry snapshot + AI).",
                         )
-                        heal_result = await self._try_rtsp_heal(cam_entity_id, dev_id, snap, area, name)
-                        if heal_result:
-                            img_bytes, prefetched_ai = heal_result
-                            snap_note = "recovered snapshot after autonomous RTSP stream heal"
-                            break   # exit snapshot loop → fall through to AI filtering + email
-                    _LOGGER.debug(
-                        "Motion %s/%s: no human at +%.1fs (conf=%.2f) — all attempts exhausted",
-                        area, name, delay, result["confidence"],
-                    )
-                    if self._ai_stats:
-                        await self._ai_stats.async_record(human=False, area=area, camera=name)
-                        self._hass.bus.async_fire(EVENT_AI_UPDATED)
-                    _log_latency("no_human_exhausted")
-                    return
-                _LOGGER.debug(
-                    "Motion %s/%s: no human at +%.1fs (conf=%.2f) — retrying",
-                    area, name, delay, result["confidence"],
-                )
-            else:
-                _LOGGER.warning(
-                    "Motion %s/%s: no image available (OSS failed + all snapshots failed) — event discarded",
-                    area, name,
-                )
-                _log_latency("no_image")
-                return
+                        heal_result = await self._try_rtsp_heal(cam_entity_id, dev_id, last_snap, area, name)
+                    if heal_result:
+                        img_bytes, prefetched_ai = heal_result
+                        snap_note = "recovered snapshot after autonomous RTSP stream heal"
+                    else:
+                        _LOGGER.debug(
+                            "Motion %s/%s: no human in any of %d snapshot(s) — discarding",
+                            area, name, len(snap_hashes),
+                        )
+                        if self._ai_stats:
+                            await self._ai_stats.async_record(human=False, area=area, camera=name)
+                            self._hass.bus.async_fire(EVENT_AI_UPDATED)
+                        _log_latency("no_human_exhausted")
+                        return
 
         # ── AI filtering ──────────────────────────────────────────────────────
         email_image    = img_bytes  # may be replaced with annotated image
@@ -615,6 +626,15 @@ class TuyaMQTTBridge:
             subject = f"{detected_label.capitalize()} detected — {area} / {name} [MQTT]"
         else:
             subject = f"Motion detected — {area} / {name} [MQTT]"
+        _img_style = 'style="max-width:640px; border:1px solid #ccc;"'
+        if burst_images:
+            img_html = "".join(
+                f'<br><img src="cid:motion_image_{i}" {_img_style}>' for i in range(len(burst_images))
+            )
+        elif email_image:
+            img_html = f'<br><img src="cid:motion_image" {_img_style}>'
+        else:
+            img_html = ""
         body    = f"""<html><body>
 <h2 style="color:#c0392b;">Motion Detected</h2>
 <table>
@@ -624,7 +644,7 @@ class TuyaMQTTBridge:
   <tr><td><b>Source</b></td><td style="color:#2980b9;">MQTT (Tuya broker · {self._entry_label})</td></tr>
   {snap_row}
 </table>
-{'<br><img src="cid:motion_image" style="max-width:640px; border:1px solid #ccc;">' if email_image else ''}
+{img_html}
 <br><p>Check your recording in the camera app.</p>
 </body></html>"""
 
@@ -634,8 +654,11 @@ class TuyaMQTTBridge:
                 _LOGGER.debug("Motion %s/%s: MQTT alerts disabled — email suppressed", area, name)
                 _log_latency("suppressed_alerts_disabled")
             else:
-                await send_email(self._hass, subject, body, to_addrs, email_image)
-                _LOGGER.info("Motion alert sent for %s/%s to %s", area, name, to_addrs)
+                await send_email(self._hass, subject, body, to_addrs, burst_images or email_image)
+                _LOGGER.info(
+                    "Motion alert sent for %s/%s to %s (%d image(s))",
+                    area, name, to_addrs, len(burst_images) or (1 if email_image else 0),
+                )
                 _log_latency("alerted")
         else:
             _LOGGER.warning(
@@ -829,6 +852,7 @@ class TuyaMQTTBridge:
 
         img_bytes: bytes | None = None
         email_image: bytes | None = None
+        burst_images: list[bytes] = []
         human_found = False
         ai_unavailable = False
         last_attempt_idx = len(SNAPSHOT_RETRY_DELAYS_S) - 1
@@ -860,10 +884,11 @@ class TuyaMQTTBridge:
                     "External motion %s/%s: human found at +%.1fs (conf=%.2f)",
                     area, name, delay, result["confidence"],
                 )
-                human_found  = True
-                email_image  = result.get("annotated_image", snap)
-                await self._maybe_record(area, name, camera_entity_id)
-                break
+                burst_images.append(result.get("annotated_image", snap))
+                if not human_found:
+                    human_found = True
+                    await self._maybe_record(area, name, camera_entity_id)
+                continue  # burst: keep collecting confirmed frames
 
             _LOGGER.debug(
                 "External motion %s/%s: no human at +%.1fs (conf=%.2f)%s",
@@ -889,6 +914,13 @@ class TuyaMQTTBridge:
         if email_image is None:
             email_image = img_bytes
         detected_label = "human" if human_found else None
+        _img_style = 'style="max-width:640px; border:1px solid #ccc;"'
+        if burst_images:
+            img_html = "".join(
+                f'<br><img src="cid:motion_image_{i}" {_img_style}>' for i in range(len(burst_images))
+            )
+        else:
+            img_html = f'<br><img src="cid:motion_image" {_img_style}>'
 
         subject = (
             f"{detected_label.capitalize()} detected — {area} / {name} [ONVIF]"
@@ -902,7 +934,7 @@ class TuyaMQTTBridge:
   <tr><td><b>Time</b></td><td>{ev_ts}</td></tr>
   <tr><td><b>Source</b></td><td style="color:#8e44ad;">ONVIF (local · {self._entry_label})</td></tr>
 </table>
-<br><img src="cid:motion_image" style="max-width:640px; border:1px solid #ccc;">
+{img_html}
 <br><p>Check your recording in the camera app.</p>
 </body></html>"""
 
@@ -916,8 +948,11 @@ class TuyaMQTTBridge:
         if not self._alerts_enabled:
             _LOGGER.debug("External motion %s/%s: alerts disabled — email suppressed", area, name)
             return
-        await send_email(self._hass, subject, body, to_addrs, email_image)
-        _LOGGER.info("External motion alert sent for %s/%s to %s", area, name, to_addrs)
+        await send_email(self._hass, subject, body, to_addrs, burst_images or email_image)
+        _LOGGER.info(
+            "External motion alert sent for %s/%s to %s (%d image(s))",
+            area, name, to_addrs, len(burst_images) or 1,
+        )
 
     def _get_all_tech_recipients(self) -> list[str]:
         """Deduplicated notify entity IDs across every area's tech recipients."""

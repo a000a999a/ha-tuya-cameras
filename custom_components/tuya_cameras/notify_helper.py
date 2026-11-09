@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from pathlib import Path
 
 from homeassistant.core import HomeAssistant
@@ -55,7 +56,7 @@ def _write_image_and_cleanup(hass: HomeAssistant, image_bytes: bytes) -> Path | 
             except OSError:
                 pass  # best-effort cleanup, never block a send over one bad file
 
-        filename = f"motion_{int(time.time() * 1000)}.jpg"
+        filename = f"motion_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}.jpg"
         path = media_root / filename
         path.write_bytes(image_bytes)
         return path
@@ -69,10 +70,11 @@ async def send_email(
     subject: str,
     html_body: str,
     notify_entities: list[str],
-    image_bytes: bytes | None = None,
+    images: list[bytes] | bytes | None = None,
 ) -> None:
-    """Send subject/html_body to every entity in notify_entities, with an
-    optional inline image (referenced in html_body as <img src="cid:motion_image">).
+    """Send subject/html_body to every entity in notify_entities, with optional
+    inline images: a single bytes is referenced as <img src="cid:motion_image">,
+    a list as <img src="cid:motion_image_0">, <img src="cid:motion_image_1">, ….
     Never raises — logs and returns on any failure, matching the old Notifier's
     fail-open behaviour (a bad email must never break the motion pipeline).
 
@@ -90,18 +92,27 @@ async def send_email(
 
     service_data: dict = {"title": subject, "message": subject, "html": html_body}
 
-    if image_bytes:
-        path = await hass.async_add_executor_job(_write_image_and_cleanup, hass, image_bytes)
-        if path:
-            rel_path = path.relative_to(_local_media_root(hass))
-            service_data["attachments"] = [{
-                "media_source": {
-                    "media_content_id": f"media-source://media_source/local/{rel_path.as_posix()}",
-                    "media_content_type": "image/jpeg",
-                },
-                "filename":   path.name,
-                "content_id": "motion_image",
-            }]
+    if isinstance(images, bytes):
+        image_list, indexed = [images], False
+    else:
+        image_list, indexed = list(images or []), True
+
+    attachments = []
+    for i, img in enumerate(image_list):
+        path = await hass.async_add_executor_job(_write_image_and_cleanup, hass, img)
+        if not path:
+            continue
+        rel_path = path.relative_to(_local_media_root(hass))
+        attachments.append({
+            "media_source": {
+                "media_content_id": f"media-source://media_source/local/{rel_path.as_posix()}",
+                "media_content_type": "image/jpeg",
+            },
+            "filename":   path.name,
+            "content_id": f"motion_image_{i}" if indexed else "motion_image",
+        })
+    if attachments:
+        service_data["attachments"] = attachments
 
     async def _send_one(entity_id: str) -> None:
         try:
