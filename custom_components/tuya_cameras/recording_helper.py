@@ -52,15 +52,17 @@ flag — every later recording attempt on that SAME camera then fails too, with
 (a full HA restart — confirmed working but a heavy hammer, and not durable since the underlying
 cause recurs).
 
-This repo already had a proven fix for exactly this class of problem, just not applied to
-recording yet: mqtt_bridge.py's snapshot-heal path (`_attempt_rtsp_heal`, live since v0.6.1)
-calls the `homeassistant.update_entity` service on the camera before retrying, which forces the
-official Tuya integration to fetch a fresh signed RTSP URL from Tuya's cloud rather than reusing
-a stale cached one. start_recording() now does the same thing, before calling
-async_create_stream(), to reduce the odds of a NEW recording ever hitting a dead URL in the first
-place. Important limitation: this does NOT un-stick an already-stuck camera (one whose Stream
-object is already wedged from a prior failed attempt) — that still needs a restart or a scoped
-config-entry reload. It only helps prevent the initial 404 that starts the stuck cascade.
+The first fix (Sept 2026) called `homeassistant.update_entity` before recording. That does not
+work, confirmed live 2026-11-10 (Door, Cage, Bèrgerie: first recording fine, every later one 404 →
+"Stream already recording"): Camera.async_create_stream() only reads stream_source() when it
+CREATES the Stream, then caches that Stream (and the signed URL inside it, Stream.source) for the
+entity's lifetime. Refreshing the entity changes nothing in the cached Stream. _prepare_stream()
+now fetches a fresh URL itself and writes it into the cached Stream (update_source() if the worker
+is running, e.g. a live view; plain assignment if it is stopped — update_source() on a stopped
+worker would leave a fast-restart flag set that makes the next stop() restart instead). It also
+frees a wedged recorder left by an earlier failed attempt, and start_recording() frees its own
+recorder when it times out, so a dead stream no longer retries the expired URL forever and no
+longer blocks the next recording.
 """
 
 from __future__ import annotations
@@ -73,9 +75,14 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from homeassistant.components.camera import get_camera_from_entity_id
+from homeassistant.components.stream.const import RECORDER_PROVIDER
 from homeassistant.core import HomeAssistant
 
 _LOGGER = logging.getLogger(__name__)
+
+# Cameras with a start_recording() in progress. A second human event on the same camera while
+# one is running is skipped quietly instead of colliding with HA's one-recorder-per-stream rule.
+_ACTIVE_RECORDINGS: set[str] = set()
 
 # Tech-alert + aggressive-prune threshold: below EITHER of these, housekeeping starts
 # deleting the oldest remaining recordings regardless of retention, not just alerting
@@ -95,11 +102,10 @@ LOW_DISK_PERCENT = 5
 # before the muxer starts trusting its timestamps.
 STREAM_WARMUP_S = 12
 
-# How long to wait after homeassistant.update_entity before trusting the camera has a
-# fresh RTSP URL — see module docstring "Stale RTSP URL refresh". Mirrors the value
-# already proven live in mqtt_bridge.py's snapshot-heal path (_attempt_rtsp_heal);
-# not yet independently re-tuned for this specific call path.
-RTSP_REFRESH_WAIT_S = 15
+# How long past the requested duration to wait for camera.record to finish before
+# declaring the recording failed: HA's 5 s lookback, waiting for the next HLS segment,
+# and the final remux/rename of the .mp4.tmp all happen after the recording window.
+RECORD_GRACE_S = 60
 
 
 def _recordings_root(hass: HomeAssistant, path_root: str) -> Path:
@@ -112,6 +118,55 @@ def _safe_slug(text: str) -> str:
     return slug or "camera"
 
 
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+async def _prepare_stream(
+    hass: HomeAssistant, camera_entity_id: str, area: str, name: str, media_root: Path,
+) -> None:
+    """Point the camera's cached Stream at a freshly signed URL and free a wedged recorder
+    of ours (see module docstring "Stale RTSP URL refresh"). Raises if the camera is busy
+    with a recording that is not ours."""
+    camera = get_camera_from_entity_id(hass, camera_entity_id)
+    stream = camera.stream
+    if stream is None:
+        return  # camera.record creates the Stream from a fresh stream_source() itself
+
+    recorder = stream.outputs().get(RECORDER_PROVIDER)
+    if recorder is not None:
+        video_path = str(getattr(recorder, "video_path", ""))
+        if not video_path.startswith(str(media_root)):
+            raise RuntimeError(f"camera is already recording to {video_path} (not started by tuya_cameras)")
+        # Ours, but no start_recording() is running for this camera any more → left over
+        # from a failed attempt (e.g. before an HA restart); it would block this one.
+        _LOGGER.warning("Freeing stuck recorder on %s/%s (was writing %s)", area, name, video_path)
+        await stream.remove_provider(recorder)
+
+    source = await camera.stream_source()
+    if not source:
+        return
+    if stream.outputs():
+        stream.update_source(source)  # worker running (live view): restart on the new URL
+    else:
+        stream.source = source        # worker stopped: its next start() uses the new URL
+
+
+async def _free_own_recorder(hass: HomeAssistant, camera_entity_id: str, video_path: str) -> None:
+    """Drop the recorder we added if it is still attached. Ends HA's blocked camera.record
+    call and stops the stream worker from retrying a dead URL indefinitely."""
+    try:
+        stream = get_camera_from_entity_id(hass, camera_entity_id).stream
+        recorder = stream.outputs().get(RECORDER_PROVIDER) if stream else None
+        if recorder is not None and getattr(recorder, "video_path", None) == video_path:
+            await stream.remove_provider(recorder)
+    except Exception as err:  # noqa: BLE001 — best-effort cleanup
+        _LOGGER.warning("Could not free recorder on %s: %s", camera_entity_id, err)
+
+
 async def start_recording(
     hass: HomeAssistant,
     camera_entity_id: str,
@@ -119,17 +174,33 @@ async def start_recording(
     name: str,
     duration_s: int,
     path_root: str,
-) -> str | None:
-    """Kick off camera.record for duration_s seconds. Returns the saved file's
-    absolute path (for referencing in the alert email), or None on failure.
+) -> tuple[str | None, str | None]:
+    """Record duration_s seconds via camera.record and verify the result.
+
+    Returns (saved_path, None) once the recording has finished AND a non-empty .mp4
+    exists on disk, (None, None) if skipped because this camera is already being recorded
+    by an earlier event, otherwise (None, reason). Never raises.
+
+    Failure detection (2026-11-10): camera.record used to be called with blocking=False,
+    i.e. fire-and-forget. HA then runs the service in its own task, and any error — even
+    the immediate "Can't write …, no access to path!" — is caught by HA core and only
+    written to home-assistant.log as "Error executing service". Our code had already
+    logged "Recording started" and returned the path, so the caller's failure alert never
+    fired: every recording failed silently from 2026-11-03 to 2026-11-10. Now camera.record
+    runs blocking (HA's handler only returns once the whole recording is written, so errors
+    surface here), and the file itself is checked afterwards, which also catches a stream
+    that dies mid-recording and leaves only an orphaned .mp4.tmp.
 
     Refreshes the camera's RTSP URL and pre-warms its stream before recording (see
-    module docstring "Stale RTSP URL refresh" and "Stream warm-up") — this makes the
-    call take up to RTSP_REFRESH_WAIT_S + STREAM_WARMUP_S seconds longer than before,
-    so callers must NOT await this inline on the alert-email path; fire it as a
-    background task instead (mqtt_bridge.py's _maybe_record does this via
-    hass.async_create_task).
+    module docstring "Stale RTSP URL refresh" and "Stream warm-up"). With the warm-up
+    plus the recording itself this takes about STREAM_WARMUP_S + duration_s, so callers
+    must NOT await it inline on the alert-email path; fire it as a background task
+    instead (mqtt_bridge.py's _maybe_record does this via hass.async_create_task).
     """
+    if camera_entity_id in _ACTIVE_RECORDINGS:
+        _LOGGER.info("Recording skipped for %s/%s: already recording this camera", area, name)
+        return None, None
+    _ACTIVE_RECORDINGS.add(camera_entity_id)
     try:
         media_root = _recordings_root(hass, path_root)
         await hass.async_add_executor_job(lambda: media_root.mkdir(parents=True, exist_ok=True))
@@ -138,19 +209,7 @@ async def start_recording(
         filename  = f"{_safe_slug(area)}_{_safe_slug(name)}_{ts}.mp4"
         full_path = media_root / filename
 
-        try:
-            await hass.services.async_call(
-                "homeassistant", "update_entity",
-                {"entity_id": camera_entity_id},
-                blocking=True,
-            )
-            await asyncio.sleep(RTSP_REFRESH_WAIT_S)
-        except Exception as refresh_err:  # noqa: BLE001 — refresh is best-effort only
-            _LOGGER.warning(
-                "RTSP URL refresh failed for %s/%s (%s) — recording anyway, may hit a "
-                "stale-token 404 if the cached URL has already expired",
-                area, name, refresh_err,
-            )
+        await _prepare_stream(hass, camera_entity_id, area, name, media_root)
 
         try:
             camera_entity = get_camera_from_entity_id(hass, camera_entity_id)
@@ -163,16 +222,41 @@ async def start_recording(
                 area, name, warmup_err,
             )
 
-        await hass.services.async_call(
-            "camera", "record",
-            {"entity_id": camera_entity_id, "filename": str(full_path), "duration": duration_s},
-            blocking=False,
+        record_task = hass.async_create_task(
+            hass.services.async_call(
+                "camera", "record",
+                {"entity_id": camera_entity_id, "filename": str(full_path), "duration": duration_s},
+                blocking=True,
+            ),
+            f"tuya_cameras record {camera_entity_id}",
         )
+        # If we give up waiting below, the task keeps running; consume its eventual
+        # exception so asyncio doesn't log "Task exception was never retrieved".
+        record_task.add_done_callback(lambda t: t.cancelled() or t.exception())
         _LOGGER.info("Recording started: %s/%s -> %s (%ds)", area, name, full_path, duration_s)
-        return str(full_path)
+
+        done, _ = await asyncio.wait({record_task}, timeout=duration_s + RECORD_GRACE_S)
+        if not done:
+            # Not cancelled (that would leave HA's recorder attached); removing the recorder
+            # instead lets HA's own camera.record call finish cleanly.
+            await _free_own_recorder(hass, camera_entity_id, str(full_path))
+            reason = f"still not finished {duration_s + RECORD_GRACE_S}s after it started (stream stalled?)"
+            _LOGGER.error("Recording failed for %s/%s: %s", area, name, reason)
+            return None, reason
+        record_task.result()  # re-raises the service's own error, e.g. path not allowed
+
+        size = await hass.async_add_executor_job(_file_size, full_path)
+        if not size:
+            reason = "camera.record finished but no video file was written (stream dropped mid-recording?)"
+            _LOGGER.error("Recording failed for %s/%s: %s — %s", area, name, reason, full_path)
+            return None, reason
+        _LOGGER.info("Recording saved: %s/%s -> %s (%d KB)", area, name, full_path, size // 1024)
+        return str(full_path), None
     except Exception as err:  # noqa: BLE001 — a failed recording must never break the alert pipeline
-        _LOGGER.error("Recording failed to start for %s/%s: %s", area, name, err)
-        return None
+        _LOGGER.error("Recording failed for %s/%s: %s", area, name, err)
+        return None, str(err)
+    finally:
+        _ACTIVE_RECORDINGS.discard(camera_entity_id)
 
 
 def _do_cleanup(hass: HomeAssistant, path_root: str, retention_days: int) -> dict:

@@ -292,7 +292,7 @@ class SmartLifeWebhookBridge:
             f"</body></html>"
         )
 
-        await send_email(self._hass, subject, body, recipients, img_bytes)
+        await send_email(self._hass, subject, body, recipients, img_bytes, image_name=f"{area} {cam_name}")
         _LOGGER.info(
             "SmartLife webhook alert sent for %s/%s to %s", area, cam_name, recipients
         )

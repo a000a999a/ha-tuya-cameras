@@ -17,11 +17,16 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import html
 import json
 import logging
 import os
+import re
+import shutil
 import socket
+import tempfile
 import time
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
 
@@ -58,8 +63,42 @@ TECH_ALERT_COOLDOWN       = 1800   # suppress duplicate tech alerts for 30 min
 # Denser early sampling costs nothing extra (still 3 attempts, same AI-call count) but trades
 # off giving a genuinely cold RTSP stream slightly less time to stabilize between attempts.
 SNAPSHOT_RETRY_DELAYS_S   = (0, 0.5, 1.5)
+
+# Burst capture (2026-11-10; tested live on Camera Door, then enabled for every camera on
+# both the MQTT and ONVIF paths). The snapshot schedule above can't actually sample at
+# 0/0.5/1.5s: every HA snapshot of a Tuya camera fetches a fresh signed stream URL from the
+# cloud and starts a new ffmpeg connection, ~2-3s each, so the three frames really landed
+# ~3-6s apart (camera OSD timestamps) and people had often left by the last one. A burst
+# opens the stream ONCE and lets ffmpeg take BURST_FRAMES frames BURST_INTERVAL_S apart in
+# stream time (confirmed on the OSD clock). Once any frame confirms a human, the email
+# carries the whole sequence (annotated where confirmed), so one AI miss doesn't drop a
+# frame. SNAPSHOT_RETRY_DELAYS_S remains the fallback when a burst yields no frames.
+BURST_FRAMES              = 4
+BURST_INTERVAL_S          = 1.0   # 0.5 s at first; stretched to 1 s (3 s span) at Alex's request
+BURST_TIMEOUT_S           = 15
+# Motion from a device missing from the camera list reloads the list — at most this often
+# per device, so a non-camera device that happens to send motion codes can't keep
+# triggering reloads (each one costs a few Tuya cloud calls).
+UNKNOWN_CAMERA_RETRY_S    = 3600
+_STREAM_URL_RE            = re.compile(r"rtsps?://\S+")   # signed URLs carry tokens — never log them
 _HEALTH_DATA_KEY           = "tuya_cameras_health"  # hass.data key — survives entry reloads,
                                     # unlike hass.data[DOMAIN][entry_id] which gets rebuilt
+
+
+def _frame_summary(delay: float, result: dict) -> str:
+    """'+0.5s human 0.78' / '+1s no 0.00' — compact per-frame AI verdict for the event log line."""
+    return f"+{delay:g}s {'human' if result['human'] else 'no'} {result['confidence']:.2f}"
+
+
+def _read_burst_frames(tmpdir: str) -> list[bytes]:
+    """Read ffmpeg's numbered burst output (f1.jpg, f2.jpg, …) in order. Executor-only."""
+    frames = []
+    for i in range(1, BURST_FRAMES + 1):
+        path = Path(tmpdir) / f"f{i}.jpg"
+        if not path.exists():
+            break
+        frames.append(path.read_bytes())
+    return frames
 
 
 class TuyaMQTTBridge:
@@ -110,6 +149,10 @@ class TuyaMQTTBridge:
         self._local_keys: dict[str, str] = {}    # device_id → local_key
         self._product_ids: dict[str, str] = {}  # device_id → product_id (for v4 blob decrypt)
         self._uuids: dict[str, str] = {}         # device_id → uuid
+        self._unknown_refresh_at: dict[str, float] = {}  # device_id → monotonic time of last list reload
+        self._unknown_warned: set[str] = set()
+        self._unknown_announced: set[str] = set()
+        self._camera_refresh_task: asyncio.Task | None = None
         self._last_msg_at: float = time.monotonic()
         self._last_tech_alert_at: float = 0.0
         self._current_client: Any = None  # live paho client; None when disconnected
@@ -361,16 +404,7 @@ class TuyaMQTTBridge:
             return
 
         # Build camera list before the code filter so we can log unknown codes from known cameras.
-        # Prefer cameras coordinator — has entity registry fallback when Tuya device API is down.
-        cameras: dict = {}
-        if self._cam_coord and self._cam_coord.data:
-            cameras = self._cam_coord.data.get("cameras", {})
-        elif self._core_coord and self._core_coord.data:
-            cam_list = self._camera_api.cameras_from_devices(
-                self._core_coord.data.get("devices", []),
-                self._core_coord.data.get("areas", {}),
-            )
-            cameras = {c["id"]: c for c in cam_list}
+        cameras = self._known_cameras()
 
         motion_dps = [s for s in status if s.get("code") in ("initiative_message", "movement_detect_pic")]
         if not motion_dps:
@@ -388,8 +422,9 @@ class TuyaMQTTBridge:
 
         cam = cameras.get(dev_id)
         if not cam:
-            _LOGGER.debug("Motion from unknown device %s — skipping", dev_id)
-            return
+            cam = await self._refresh_for_unknown_camera(dev_id)
+            if not cam:
+                return
 
         area = cam.get("area", "Unknown")
         name = cam["name"]
@@ -472,18 +507,18 @@ class TuyaMQTTBridge:
             _LOGGER.debug("Motion %s/%s: no OSS image — trying HA snapshot(s)", area, name)
             snap_hashes: list[str] = []
             last_snap: bytes | None = None
-            for attempt, delay in enumerate(SNAPSHOT_RETRY_DELAYS_S):
-                if delay:
-                    await asyncio.sleep(delay)
-                snap = await self._get_ha_snapshot(dev_id, cam_entity_id)
-                if not snap:
-                    _LOGGER.debug(
-                        "Motion %s/%s: snapshot %d/%d failed",
-                        area, name, attempt + 1, len(SNAPSHOT_RETRY_DELAYS_S),
-                    )
-                    continue
+            analysed: list[tuple[bytes, dict]] = []   # (raw frame, AI result), time order
+            frame_log: list[str] = []                 # one-line per-frame AI summary for INFO
+            snaps = self._iter_snapshots(dev_id, cam_entity_id, area, name)
+            async for delay, snap in snaps:
                 last_snap = snap
-                snap_hashes.append(hashlib.md5(snap).hexdigest())
+                snap_hash = hashlib.md5(snap).hexdigest()
+                is_dup    = bool(snap_hashes) and snap_hashes[-1] == snap_hash
+                snap_hashes.append(snap_hash)
+                if is_dup and self._ai_client is not None:
+                    # Same picture as the previous frame — same AI verdict, nothing new to attach.
+                    frame_log.append(f"+{delay:g}s duplicate")
+                    continue
                 snap_age  = age_s + delay
                 snap_note = f"live snapshot ({snap_age:.0f}s after event — person may have left)"
                 _LOGGER.debug(
@@ -510,22 +545,17 @@ class TuyaMQTTBridge:
                     break
                 # Burst: no early exit on a human — run every scheduled snapshot through AI
                 # and keep each confirmed frame, so the email shows the movement sequence.
+                analysed.append((snap, result))
+                frame_log.append(_frame_summary(delay, result))
                 if result["human"]:
                     burst_images.append(result.get("annotated_image", snap))
                     if img_bytes is None:
                         img_bytes     = snap
                         prefetched_ai = result
-                    _LOGGER.debug(
-                        "Motion %s/%s: human at +%.1fs (conf=%.2f) — %d frame(s) collected",
-                        area, name, delay, result["confidence"], len(burst_images),
-                    )
-                else:
-                    _LOGGER.debug(
-                        "Motion %s/%s: no human at +%.1fs (conf=%.2f)",
-                        area, name, delay, result["confidence"],
-                    )
             else:
                 # Loop ran to the end (AI mode). img_bytes set ⇒ ≥1 confirmed frame, fall through.
+                if frame_log:
+                    _LOGGER.info("Motion %s/%s: frames — %s", area, name, ", ".join(frame_log))
                 if not snap_hashes:
                     _LOGGER.warning(
                         "Motion %s/%s: no image available (OSS failed + all snapshots failed) — event discarded",
@@ -546,7 +576,7 @@ class TuyaMQTTBridge:
                         await self._send_tech_alert(
                             f"Stale RTSP — {area}/{name}",
                             f"Motion at <b>{name}</b> ({area}) at {ev_ts}.<br><br>"
-                            f"{len(snap_hashes)} of {len(SNAPSHOT_RETRY_DELAYS_S)} snapshots were "
+                            f"{len(snap_hashes)} snapshots were "
                             f"byte-for-byte identical — RTSP stream is buffering a stale pre-event frame "
                             f"(Tuya token expiry window). Attempting autonomous heal "
                             f"(update_entity → 15 s reconnect → retry snapshot + AI).",
@@ -565,6 +595,15 @@ class TuyaMQTTBridge:
                             self._hass.bus.async_fire(EVENT_AI_UPDATED)
                         _log_latency("no_human_exhausted")
                         return
+            await snaps.aclose()  # after a break the generator is still suspended at a yield
+
+            if burst_images:
+                # Whole sequence once any frame is confirmed: annotated where the AI saw a
+                # person, raw otherwise (a dim/overexposed frame the AI missed still shows them).
+                burst_images = [
+                    res.get("annotated_image", raw) if res["human"] else raw
+                    for raw, res in analysed
+                ]
 
         # ── AI filtering ──────────────────────────────────────────────────────
         email_image    = img_bytes  # may be replaced with annotated image
@@ -654,7 +693,10 @@ class TuyaMQTTBridge:
                 _LOGGER.debug("Motion %s/%s: MQTT alerts disabled — email suppressed", area, name)
                 _log_latency("suppressed_alerts_disabled")
             else:
-                await send_email(self._hass, subject, body, to_addrs, burst_images or email_image)
+                await send_email(
+                    self._hass, subject, body, to_addrs, burst_images or email_image,
+                    image_name=f"{area} {name}",
+                )
                 _LOGGER.info(
                     "Motion alert sent for %s/%s to %s (%d image(s))",
                     area, name, to_addrs, len(burst_images) or (1 if email_image else 0),
@@ -679,6 +721,80 @@ class TuyaMQTTBridge:
         matches  = [a for a in detected if not allowed or a in allowed]
         return matches[0] if matches else None
 
+    def _known_cameras(self) -> dict:
+        """{device_id: camera} for this project. Prefers the cameras coordinator (it has the
+        entity-registry fallback for when the Tuya device API is down)."""
+        if self._cam_coord and self._cam_coord.data:
+            return self._cam_coord.data.get("cameras", {})
+        if self._core_coord and self._core_coord.data:
+            cam_list = self._camera_api.cameras_from_devices(
+                self._core_coord.data.get("devices", []),
+                self._core_coord.data.get("areas", {}),
+            )
+            return {c["id"]: c for c in cam_list}
+        return {}
+
+    async def _refresh_for_unknown_camera(self, dev_id: str) -> dict | None:
+        """Motion from a device that isn't in the camera list: usually a camera added (or a
+        replacement paired) since the list was last loaded — at HA start, every 14 days, or
+        on refresh_all. Until 2026-11-11 such motion was dropped with only a DEBUG line, so a
+        new camera stayed silently unprotected until someone pressed Refresh.
+
+        Reloads the list once (at most every UNKNOWN_CAMERA_RETRY_S per device; concurrent
+        events share one reload) and returns the camera if it is now known — the caller then
+        processes this very event — sending a one-off tech alert. Otherwise logs a WARNING
+        (once per device per HA run) and returns None.
+        """
+        last = self._unknown_refresh_at.get(dev_id)
+        reload_running = self._camera_refresh_task is not None and not self._camera_refresh_task.done()
+        if not reload_running and (last is None or time.monotonic() - last > UNKNOWN_CAMERA_RETRY_S):
+            self._unknown_refresh_at[dev_id] = time.monotonic()
+            self._camera_refresh_task = self._hass.async_create_task(self._refresh_camera_list())
+        if self._camera_refresh_task is not None and not self._camera_refresh_task.done():
+            await asyncio.shield(self._camera_refresh_task)  # also covers a reload another event started
+
+        cam = self._known_cameras().get(dev_id)
+        if cam is None:
+            if dev_id not in self._unknown_warned:
+                self._unknown_warned.add(dev_id)
+                _LOGGER.warning(
+                    "Motion from unknown device %s — not in %s's camera list even after reloading "
+                    "it; ignoring its motion (is it a camera in this Tuya project?)",
+                    dev_id, self._entry_label,
+                )
+            return None
+
+        if dev_id in self._unknown_announced:
+            return cam  # a concurrent event already announced it
+        self._unknown_announced.add(dev_id)
+        area, name = (cam.get("area") or "").strip(), cam["name"]
+        _LOGGER.warning("New camera detected: %s/%s (%s) — added to the camera list", area, name, dev_id)
+        missing = (
+            "<br><br>⚠ It has <b>no area</b> — set its room in Smart Life (or its area in HA), "
+            "then run tuya_cameras.refresh_all, or its alerts reach nobody."
+            if not area else
+            "<br><br>⚠ No human-alert recipients are configured for this area yet."
+            if not self._get_recipients(area, "human") else ""
+        )
+        self._hass.async_create_task(self._send_tech_alert(
+            f"New camera detected — {area or 'no area'} — {name}",
+            f"Motion arrived from <b>{html.escape(name)}</b> ({dev_id}), which was not in the camera "
+            f"list yet, so the list was reloaded. Alerts, snapshots and recordings work for it "
+            f"from now on. Its SD-card sensors and buttons appear after the next "
+            f"tuya_cameras.refresh_all or HA restart.{missing}",
+        ))
+        return cam
+
+    async def _refresh_camera_list(self) -> None:
+        try:
+            if self._core_coord:
+                await self._core_coord.async_refresh()
+            if self._cam_coord:
+                await self._cam_coord.async_refresh()
+            await self._hass.async_add_executor_job(self._fetch_local_keys)  # v4 blob decrypt keys
+        except Exception as err:  # noqa: BLE001 — never break motion handling
+            _LOGGER.warning("Camera list reload for %s failed: %s", self._entry_label, err)
+
     async def _find_camera_entity_id(self, dev_id: str) -> str | None:
         """Look up the HA camera entity ID for a Tuya device ID."""
         try:
@@ -693,6 +809,84 @@ class TuyaMQTTBridge:
         except Exception:
             pass
         return None
+
+    async def _iter_snapshots(self, dev_id: str, entity_id: str | None, area: str, name: str):
+        """Yield (offset_s, jpeg) for the motion pipeline (MQTT and ONVIF): a one-connection
+        burst, or — if that yields nothing — the SNAPSHOT_RETRY_DELAYS_S single snapshots."""
+        frames = await self._capture_burst(entity_id, area, name)
+        if frames:
+            for i, frame in enumerate(frames):
+                yield i * BURST_INTERVAL_S, frame
+            return
+        _LOGGER.warning("Motion %s/%s: burst capture got no frames — falling back to single snapshots", area, name)
+        for attempt, delay in enumerate(SNAPSHOT_RETRY_DELAYS_S):
+            if delay:
+                await asyncio.sleep(delay)
+            snap = await self._get_ha_snapshot(dev_id, entity_id)
+            if not snap:
+                _LOGGER.debug(
+                    "Motion %s/%s: snapshot %d/%d failed",
+                    area, name, attempt + 1, len(SNAPSHOT_RETRY_DELAYS_S),
+                )
+                continue
+            yield delay, snap
+
+    async def _capture_burst(self, entity_id: str | None, area: str, name: str) -> list[bytes]:
+        """Take BURST_FRAMES frames BURST_INTERVAL_S apart from ONE stream connection.
+
+        Uses the camera's own stream_source() — for Tuya that fetches a fresh signed URL,
+        exactly what each HA snapshot already does — then one ffmpeg run with an fps filter,
+        so the spacing is real stream time instead of per-snapshot connection overhead.
+        Returns whatever frames were written (possibly fewer, or none on failure).
+        """
+        if not entity_id:
+            return []
+        try:
+            from homeassistant.components.camera import get_camera_from_entity_id
+            from homeassistant.components.ffmpeg import get_ffmpeg_manager
+            url    = await get_camera_from_entity_id(self._hass, entity_id).stream_source()
+            binary = get_ffmpeg_manager(self._hass).binary
+        except Exception as err:  # noqa: BLE001 — never break the motion pipeline
+            _LOGGER.warning("Motion %s/%s: burst setup failed: %s", area, name, err)
+            return []
+        if not url:
+            return []
+
+        tmpdir = await self._hass.async_add_executor_job(tempfile.mkdtemp, None, "tuya_burst_")
+        t0     = time.monotonic()
+        stderr = b""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                binary, "-hide_banner", "-loglevel", "error",
+                "-i", url,
+                "-vf", f"fps={1 / BURST_INTERVAL_S:g}",
+                "-frames:v", str(BURST_FRAMES), "-q:v", "3",
+                str(Path(tmpdir) / "f%d.jpg"),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, stderr = await asyncio.wait_for(proc.communicate(), BURST_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                _LOGGER.warning("Motion %s/%s: burst capture timed out after %ds", area, name, BURST_TIMEOUT_S)
+            frames = await self._hass.async_add_executor_job(_read_burst_frames, tmpdir)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Motion %s/%s: burst capture failed: %s", area, name, _STREAM_URL_RE.sub("<stream>", str(err)))
+            frames = []
+        finally:
+            await self._hass.async_add_executor_job(shutil.rmtree, tmpdir, True)
+
+        _LOGGER.log(
+            logging.DEBUG if len(frames) == BURST_FRAMES else logging.WARNING,
+            "Motion %s/%s: burst captured %d/%d frame(s) in %.1fs%s",
+            area, name, len(frames), BURST_FRAMES, time.monotonic() - t0,
+            f" — ffmpeg: {_STREAM_URL_RE.sub('<stream>', stderr.decode(errors='replace').strip())[:300]}"
+            if stderr and len(frames) < BURST_FRAMES else "",
+        )
+        return frames
 
     async def _get_ha_snapshot(self, dev_id: str, entity_id: str | None = None) -> bytes | None:
         """Fetch a live snapshot from the HA camera entity for this Tuya device."""
@@ -788,18 +982,18 @@ class TuyaMQTTBridge:
             return
 
         async def _record_and_alert() -> None:
-            result = await start_recording(
+            path, reason = await start_recording(
                 self._hass, camera_entity_id, area, name,
                 self._recording_duration_s, self._recording_path,
             )
-            if result is None:
+            if path is None and reason:  # (None, None) = skipped, an earlier event is recording
                 await self._send_tech_alert(
                     f"Recording failed — {area} — {name}",
                     f"A recording was triggered for {name} in {area} after a human was confirmed, "
-                    f"but it could not be started. The camera's RTSP stream may be stuck (a prior "
-                    f"failed recording left it wedged) or its signed URL may have been stale. "
-                    f"This motion event has no recording. If this repeats, reload the camera's "
-                    f"config entry in HA to un-stick the stream.",
+                    f"but no video was saved.<br><br><b>Reason:</b> {html.escape(reason)}"
+                    f"<br><br>This motion event has no recording. The next recording on this "
+                    f"camera fetches a fresh stream URL and frees a stuck stream by itself; if "
+                    f"this alert keeps repeating, check home-assistant.log for stream_worker errors.",
                 )
 
         self._hass.async_create_task(_record_and_alert())
@@ -840,10 +1034,10 @@ class TuyaMQTTBridge:
         onvif_motion service on that sensor turning on, which routes here.
 
         Reuses the exact same snapshot → AI → email pipeline as the MQTT path,
-        including the same SNAPSHOT_RETRY_DELAYS_S multi-attempt retry (added
-        2026-08-31 — the original single-shot version had no way to catch a subject
-        who wasn't perfectly framed at the exact trigger instant, unlike the MQTT
-        path). Skips the Tuya DPS/OSS-image steps since there's no Tuya motion
+        including the same burst capture (2026-11-10; before that the
+        SNAPSHOT_RETRY_DELAYS_S retry, added 2026-08-31 because the original
+        single-shot version had no way to catch a subject who wasn't perfectly
+        framed at the exact trigger instant). Skips the Tuya DPS/OSS-image steps since there's no Tuya motion
         payload — the snapshot comes directly from the already-known HA camera
         entity instead, over the local network (no cloud relay, so typically much
         faster per-attempt than the MQTT path's go2rtc/cloud-relayed snapshots).
@@ -855,19 +1049,19 @@ class TuyaMQTTBridge:
         burst_images: list[bytes] = []
         human_found = False
         ai_unavailable = False
-        last_attempt_idx = len(SNAPSHOT_RETRY_DELAYS_S) - 1
+        analysed: list[tuple[bytes, dict]] = []   # (raw frame, AI result), time order
+        frame_log: list[str] = []
+        last_hash: str | None = None
 
-        for attempt, delay in enumerate(SNAPSHOT_RETRY_DELAYS_S):
-            if delay:
-                await asyncio.sleep(delay)
-            snap = await self._get_ha_snapshot(dev_id=camera_entity_id, entity_id=camera_entity_id)
-            if not snap:
-                _LOGGER.debug(
-                    "External motion %s/%s: snapshot %d/%d failed",
-                    area, name, attempt + 1, len(SNAPSHOT_RETRY_DELAYS_S),
-                )
+        # Same burst capture as the MQTT path (one stream connection, BURST_FRAMES frames,
+        # single-snapshot fallback) — see BURST_FRAMES.
+        snaps = self._iter_snapshots(camera_entity_id, camera_entity_id, area, name)
+        async for delay, snap in snaps:
+            snap_hash = hashlib.md5(snap).hexdigest()
+            if snap_hash == last_hash and self._ai_client is not None:
+                frame_log.append(f"+{delay:g}s duplicate")
                 continue
-
+            last_hash = snap_hash
             img_bytes = snap  # keep the most recent successful snapshot as a fallback
 
             if self._ai_client is None:
@@ -879,22 +1073,21 @@ class TuyaMQTTBridge:
                 ai_unavailable = True
                 break
 
-            if result["human"]:
-                _LOGGER.info(
-                    "External motion %s/%s: human found at +%.1fs (conf=%.2f)",
-                    area, name, delay, result["confidence"],
-                )
-                burst_images.append(result.get("annotated_image", snap))
-                if not human_found:
-                    human_found = True
-                    await self._maybe_record(area, name, camera_entity_id)
-                continue  # burst: keep collecting confirmed frames
+            analysed.append((snap, result))
+            frame_log.append(_frame_summary(delay, result))
+            if result["human"] and not human_found:
+                human_found = True
+                await self._maybe_record(area, name, camera_entity_id)
+        await snaps.aclose()
 
-            _LOGGER.debug(
-                "External motion %s/%s: no human at +%.1fs (conf=%.2f)%s",
-                area, name, delay, result["confidence"],
-                " — retrying" if attempt < last_attempt_idx else " — all attempts exhausted",
-            )
+        if frame_log:
+            _LOGGER.info("External motion %s/%s: frames — %s", area, name, ", ".join(frame_log))
+        if human_found:
+            # Whole sequence once any frame is confirmed — same policy as the MQTT path.
+            burst_images = [
+                res.get("annotated_image", raw) if res["human"] else raw
+                for raw, res in analysed
+            ]
 
         if not img_bytes:
             _LOGGER.warning("External motion %s/%s: all snapshot attempts failed — event discarded", area, name)
@@ -948,7 +1141,10 @@ class TuyaMQTTBridge:
         if not self._alerts_enabled:
             _LOGGER.debug("External motion %s/%s: alerts disabled — email suppressed", area, name)
             return
-        await send_email(self._hass, subject, body, to_addrs, burst_images or email_image)
+        await send_email(
+            self._hass, subject, body, to_addrs, burst_images or email_image,
+            image_name=f"{area} {name}",
+        )
         _LOGGER.info(
             "External motion alert sent for %s/%s to %s (%d image(s))",
             area, name, to_addrs, len(burst_images) or 1,

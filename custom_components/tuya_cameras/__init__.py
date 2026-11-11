@@ -12,7 +12,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.event import async_track_time_interval
 
 from .ai_client import AIClient
@@ -794,8 +794,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     async def _cleanup_stale_entities() -> None:
-        """Remove entity registry entries for cameras no longer in coordinator data."""
+        """Remove entity AND device registry entries for cameras no longer in coordinator
+        data (removing only the entities, as before 2026-11-11, left empty devices behind
+        that the UI couldn't delete — seen with Camera Door / lightbulp2)."""
         current_ids = set((coordinator.data or {}).get("cameras", {}).keys())
+        if not current_ids:
+            return  # an empty camera list is a failed fetch, never "every camera removed"
         registry = er.async_get(hass)
         for entity in list(registry.entities.values()):
             if entity.config_entry_id != entry.entry_id or entity.platform != DOMAIN:
@@ -807,6 +811,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if dev_id not in current_ids:
                 _LOGGER.info("Removing stale entity %s (device %s removed from account)", entity.entity_id, dev_id)
                 registry.async_remove(entity.entity_id)
+
+        dev_reg = dr.async_get(hass)
+        for device in dr.async_entries_for_config_entry(dev_reg, entry.entry_id):
+            cam_ids = {i[1] for i in device.identifiers if i[0] == DOMAIN and i[1] != entry.entry_id}
+            if cam_ids and not cam_ids & current_ids:
+                _LOGGER.info("Removing stale device '%s' (%s removed from account)", device.name, ", ".join(cam_ids))
+                dev_reg.async_update_device(device.id, remove_config_entry_id=entry.entry_id)
 
     entry.async_on_unload(
         coordinator.async_add_listener(lambda: hass.async_create_task(_cleanup_stale_entities()))
@@ -870,6 +881,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         refresh_days,
     )
     return True
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: ConfigEntry, device_entry: dr.DeviceEntry,
+) -> bool:
+    """Show HA's Delete button only for camera devices no longer in the Tuya account;
+    the entry's own "Tuya Cameras" device and live cameras stay protected."""
+    data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    coordinator = data.get("coordinator") if isinstance(data, dict) else None
+    current_ids = set(((coordinator.data if coordinator else None) or {}).get("cameras", {}).keys())
+    cam_ids = {i[1] for i in device_entry.identifiers if i[0] == DOMAIN and i[1] != entry.entry_id}
+    return bool(cam_ids) and bool(current_ids) and not cam_ids & current_ids
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

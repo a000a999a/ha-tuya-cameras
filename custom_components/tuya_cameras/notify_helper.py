@@ -16,10 +16,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-import uuid
 from pathlib import Path
 
 from homeassistant.core import HomeAssistant
+
+from .recording_helper import _safe_slug
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -40,24 +41,32 @@ def _local_media_root(hass: HomeAssistant) -> Path:
     return Path(hass.config.media_dirs.get("local", hass.config.path("media")))
 
 
-def _write_image_and_cleanup(hass: HomeAssistant, image_bytes: bytes) -> Path | None:
-    """Write one motion image under the local media-source root, prune anything
-    older than the retention window. Runs in the executor — blocking file I/O.
+def _write_image_and_cleanup(hass: HomeAssistant, image_bytes: bytes, stem: str) -> Path | None:
+    """Write one motion image as <stem>.jpg under the local media-source root, prune
+    anything older than the retention window. Runs in the executor — blocking file I/O.
+
+    stem is e.g. "Winterthur_Camera_Door_2026-11-10_15-20-05_2" (UTC, same naming as
+    the recordings) so a media gallery — and the email attachment name — show which
+    camera and when. The prune covers every top-level .jpg here, including the older
+    motion_<epoch-ms>_<hex>.jpg names; recordings live in a subfolder and are untouched.
     """
     try:
         media_root = _local_media_root(hass) / _MEDIA_SUBDIR
         media_root.mkdir(parents=True, exist_ok=True)
 
         cutoff = time.time() - _RETENTION_SECONDS
-        for old in media_root.glob("motion_*.jpg"):
+        for old in media_root.glob("*.jpg"):
             try:
                 if old.stat().st_mtime < cutoff:
                     old.unlink()
             except OSError:
                 pass  # best-effort cleanup, never block a send over one bad file
 
-        filename = f"motion_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}.jpg"
-        path = media_root / filename
+        path = media_root / f"{stem}.jpg"
+        n = 2
+        while path.exists():  # two events on one camera within the same second
+            path = media_root / f"{stem}-{n}.jpg"
+            n += 1
         path.write_bytes(image_bytes)
         return path
     except OSError as err:
@@ -71,10 +80,13 @@ async def send_email(
     html_body: str,
     notify_entities: list[str],
     images: list[bytes] | bytes | None = None,
+    image_name: str | None = None,
 ) -> None:
     """Send subject/html_body to every entity in notify_entities, with optional
     inline images: a single bytes is referenced as <img src="cid:motion_image">,
     a list as <img src="cid:motion_image_0">, <img src="cid:motion_image_1">, ….
+    image_name (e.g. "Garden Front Camera") names the saved image files
+    <image_name>_<UTC time>[_<n>].jpg; without it they are named motion_<UTC time>.
     Never raises — logs and returns on any failure, matching the old Notifier's
     fail-open behaviour (a bad email must never break the motion pipeline).
 
@@ -97,9 +109,13 @@ async def send_email(
     else:
         image_list, indexed = list(images or []), True
 
+    # "Garden " + " Front Camera" → "Garden_Front_Camera" (area names can carry stray spaces)
+    slug = "_".join(part for part in _safe_slug(image_name or "motion").split("_") if part)
+    base = f"{slug}_{time.strftime('%Y-%m-%d_%H-%M-%S', time.gmtime())}"
     attachments = []
     for i, img in enumerate(image_list):
-        path = await hass.async_add_executor_job(_write_image_and_cleanup, hass, img)
+        stem = f"{base}_{i + 1}" if len(image_list) > 1 else base
+        path = await hass.async_add_executor_job(_write_image_and_cleanup, hass, img, stem)
         if not path:
             continue
         rel_path = path.relative_to(_local_media_root(hass))
