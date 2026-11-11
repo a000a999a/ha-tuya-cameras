@@ -37,6 +37,9 @@ Running across **16 cameras**, **3 separate Tuya developer projects / SmartLife 
 
 > Cameras using Tuya's `v4.0 initiative_message` payload format (`keyId: "default"`) can't have their inline motion thumbnail decrypted — that key isn't exposed by any Tuya Open API, so it's a platform limitation rather than a per-camera bug. Those cameras still alert correctly via the RTSP snapshot fallback.
 
+For the machine that runs Home Assistant (and optionally the AI service), see
+[Hardware recommendations](https://github.com/a000a999a/ha-tuya-home-core#hardware-recommendations).
+
 ## Prerequisites
 
 - **[Tuya Home Core](https://github.com/a000a999a/ha-tuya-home-core)** installed and configured
