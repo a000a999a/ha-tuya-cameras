@@ -20,7 +20,7 @@ from pathlib import Path
 
 from homeassistant.core import HomeAssistant
 
-from .recording_helper import _safe_slug
+from .recording_helper import file_label, file_stamp
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,10 +45,11 @@ def _write_image_and_cleanup(hass: HomeAssistant, image_bytes: bytes, stem: str)
     """Write one motion image as <stem>.jpg under the local media-source root, prune
     anything older than the retention window. Runs in the executor — blocking file I/O.
 
-    stem is e.g. "Winterthur_Camera_Door_2026-11-10_15-20-05_2" (UTC, same naming as
-    the recordings) so a media gallery — and the email attachment name — show which
-    camera and when. The prune covers every top-level .jpg here, including the older
-    motion_<epoch-ms>_<hex>.jpg names; recordings live in a subfolder and are untouched.
+    stem is e.g. "2026-11-10_16-20-05_Garden_Front_Camera_2" (local time first, same
+    naming as the recordings) so name order is time order in a media gallery, and the
+    email attachment name shows which camera and when. The prune goes by file age and
+    covers every top-level .jpg here, whatever its name; recordings live in a subfolder
+    and are untouched.
     """
     try:
         media_root = _local_media_root(hass) / _MEDIA_SUBDIR
@@ -86,7 +87,7 @@ async def send_email(
     inline images: a single bytes is referenced as <img src="cid:motion_image">,
     a list as <img src="cid:motion_image_0">, <img src="cid:motion_image_1">, ….
     image_name (e.g. "Garden Front Camera") names the saved image files
-    <image_name>_<UTC time>[_<n>].jpg; without it they are named motion_<UTC time>.
+    <local time>_<image_name>[_<n>].jpg; without it they are named <local time>_motion.
     Never raises — logs and returns on any failure, matching the old Notifier's
     fail-open behaviour (a bad email must never break the motion pipeline).
 
@@ -109,9 +110,7 @@ async def send_email(
     else:
         image_list, indexed = list(images or []), True
 
-    # "Garden " + " Front Camera" → "Garden_Front_Camera" (area names can carry stray spaces)
-    slug = "_".join(part for part in _safe_slug(image_name or "motion").split("_") if part)
-    base = f"{slug}_{time.strftime('%Y-%m-%d_%H-%M-%S', time.gmtime())}"
+    base = f"{file_stamp()}_{file_label(image_name or 'motion')}"
     attachments = []
     for i, img in enumerate(image_list):
         stem = f"{base}_{i + 1}" if len(image_list) > 1 else base

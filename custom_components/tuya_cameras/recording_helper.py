@@ -77,6 +77,7 @@ from typing import Awaitable, Callable
 from homeassistant.components.camera import get_camera_from_entity_id
 from homeassistant.components.stream.const import RECORDER_PROVIDER
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -116,6 +117,22 @@ def _recordings_root(hass: HomeAssistant, path_root: str) -> Path:
 def _safe_slug(text: str) -> str:
     slug = "".join(c if c.isalnum() else "_" for c in text).strip("_")
     return slug or "camera"
+
+
+def file_label(text: str) -> str:
+    """'Garden ' + ' Front Camera' -> 'Garden_Front_Camera': a file-name-safe label with
+    runs of underscores collapsed (area names can carry stray spaces)."""
+    return "_".join(part for part in _safe_slug(text).split("_") if part) or "camera"
+
+
+def file_stamp() -> str:
+    """Timestamp that STARTS every saved image/recording name, in Home Assistant's local
+    time zone (the time people see in their camera app), e.g. 2026-11-11_17-54-52.
+
+    Leading with the time makes alphabetical order equal time order — HA's media browser
+    can only sort by name — and lets gallery cards parse the date from the name.
+    """
+    return dt_util.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 
 def _file_size(path: Path) -> int:
@@ -205,8 +222,7 @@ async def start_recording(
         media_root = _recordings_root(hass, path_root)
         await hass.async_add_executor_job(lambda: media_root.mkdir(parents=True, exist_ok=True))
 
-        ts = time.strftime("%Y-%m-%d_%H-%M-%S", time.gmtime())
-        filename  = f"{_safe_slug(area)}_{_safe_slug(name)}_{ts}.mp4"
+        filename  = f"{file_stamp()}_{file_label(f'{area} {name}')}.mp4"
         full_path = media_root / filename
 
         await _prepare_stream(hass, camera_entity_id, area, name, media_root)
