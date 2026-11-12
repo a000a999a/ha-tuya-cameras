@@ -108,6 +108,12 @@ STREAM_WARMUP_S = 12
 # and the final remux/rename of the .mp4.tmp all happen after the recording window.
 RECORD_GRACE_S = 60
 
+# A recording that dies mid-way (e.g. the Tuya relay's "non monotonically increasing
+# dts" muxer error) leaves its half-written <name>.mp4.tmp behind, and retention
+# cleanup only ever looked at *.mp4. A live recording finishes within duration +
+# RECORD_GRACE_S, so any .mp4.tmp older than this is an orphan and safe to delete.
+ORPHAN_TMP_AGE_S = 3600
+
 
 def _recordings_root(hass: HomeAssistant, path_root: str) -> Path:
     """Root directory for a given recording_path config value, under /config/media."""
@@ -279,11 +285,20 @@ def _do_cleanup(hass: HomeAssistant, path_root: str, retention_days: int) -> dic
     """Blocking part of housekeeping — runs in the executor."""
     media_root = _recordings_root(hass, path_root)
     result = {
-        "deleted_by_retention": 0, "deleted_by_space": 0,
+        "deleted_by_retention": 0, "deleted_by_space": 0, "deleted_orphan_tmp": 0,
         "low": False, "free_gb": None, "free_pct": None,
     }
     if not media_root.exists():
         return result
+
+    tmp_cutoff = time.time() - ORPHAN_TMP_AGE_S
+    for f in media_root.glob("*.mp4.tmp"):
+        try:
+            if f.stat().st_mtime < tmp_cutoff:
+                f.unlink()
+                result["deleted_orphan_tmp"] += 1
+        except OSError:
+            pass  # best-effort — one bad file must never block the rest
 
     cutoff = time.time() - retention_days * 86400
     files = sorted(media_root.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
@@ -343,10 +358,11 @@ async def housekeep_recordings(
         _LOGGER.error("Recording housekeeping failed: %s", err)
         return
 
-    if result["deleted_by_retention"] or result["deleted_by_space"]:
+    if result["deleted_by_retention"] or result["deleted_by_space"] or result["deleted_orphan_tmp"]:
         _LOGGER.info(
-            "Recording housekeeping: %d deleted (retention), %d deleted (low disk space)",
-            result["deleted_by_retention"], result["deleted_by_space"],
+            "Recording housekeeping: %d deleted (retention), %d deleted (low disk space), "
+            "%d orphaned .mp4.tmp removed (failed recordings)",
+            result["deleted_by_retention"], result["deleted_by_space"], result["deleted_orphan_tmp"],
         )
 
     if result["low"]:
