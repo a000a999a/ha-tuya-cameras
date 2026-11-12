@@ -81,6 +81,6 @@ CONF_RECORDING_PATH           = "recording_path"
 CONF_RECORDING_RETENTION_DAYS = "recording_retention_days"
 CONF_SNAPSHOT_RETENTION_DAYS  = "snapshot_retention_days"
 DEFAULT_RECORDING_DURATION_S     = 60
-DEFAULT_RECORDING_PATH           = "tuya_cameras/recordings"  # relative to /config/www — see recording_helper.py
+DEFAULT_RECORDING_PATH           = "tuya_cameras/recordings"  # relative to /config/media — see recording_helper.py
 DEFAULT_RECORDING_RETENTION_DAYS = 7
 DEFAULT_SNAPSHOT_RETENTION_DAYS  = 7

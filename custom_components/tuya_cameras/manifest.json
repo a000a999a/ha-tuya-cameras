@@ -9,7 +9,7 @@
     "paho-mqtt>=1.6.1",
     "cryptography>=41.0.0"
   ],
-  "dependencies": ["tuya_home_core"],
+  "dependencies": ["tuya_home_core", "ffmpeg"],
   "codeowners": ["@a000a999a"],
   "iot_class": "cloud_push",
   "config_flow": true

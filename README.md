@@ -248,37 +248,43 @@ One button per camera. Press to format via Tuya Cloud API — no confirmation pr
 - `sensor.<name>_status` — online / offline
 
 ### Local recording on human detection
-Records a video clip via `camera.record` when AI confirms a human — never on raw,
-unfiltered motion, so a false positive never burns a clip. Applies to both the MQTT
-and ONVIF motion paths. Configure under Settings → Devices & Services → Tuya Cameras
-→ Configure → "Local recording on human detection": enable/disable, clip duration,
-storage path, and retention period. A separate housekeeping job runs on its own
-6-hour schedule, deleting recordings past the retention period and, if disk space
-still runs low afterwards, pruning the oldest remaining files and sending a tech
-alert. Videos are referenced by file path in the alert email, never attached.
+Records a video clip when AI confirms a human — never on raw, unfiltered motion, so a
+false positive never burns a clip. Applies to both the MQTT and ONVIF motion paths.
+Configure under Settings → Devices & Services → Tuya Cameras → Configure → "Local
+recording on human detection": enable/disable, clip duration, storage path, and
+retention period. A separate housekeeping job runs on its own 6-hour schedule,
+deleting recordings past the retention period and, if disk space still runs low
+afterwards, pruning the oldest remaining files and sending a tech alert. Videos are
+referenced by file path in the alert email, never attached. If a recording fails, a
+tech alert says why.
 
-**Storage location:** recordings are written under `/config/www` (e.g.
-`/config/www/tuya_cameras/recordings` by default), not the media-source "local"
-root. This isn't an arbitrary choice — it's the only local path Home Assistant's
-own `camera.record` service (`stream.async_record()`) will write to without
-extra setup. HA enforces its own security allowlist independent of filesystem
-permissions; straight from `core_config.py`:
+**Recorder:** clips are recorded with ffmpeg, which ships with every Home Assistant
+installation (HA OS, Supervised, Container) — nothing extra to install. Only a bare
+Python "HA Core" install needs ffmpeg from the system's package manager, which HA's
+own camera features require there anyway. ffmpeg is used instead of Home Assistant's
+`camera.record` service because cameras relayed through the Tuya cloud occasionally
+send a frame with an out-of-order timestamp: `camera.record` then aborts and saves
+nothing, while ffmpeg repairs the timestamp and keeps recording. It also starts
+recording about 2 seconds after the human is confirmed, without the 12-second stream
+warm-up `camera.record` needs. If ffmpeg fails, the integration falls back to
+`camera.record`.
 
-```python
-hac.allowlist_external_dirs = {hass.config.path("www"), *hac.media_dirs.values()}
+**Storage location:** recordings are written to `/config/media/<storage path>`
+(default `/config/media/tuya_cameras/recordings`), on the same disk as your Home
+Assistant configuration, so they survive restarts and updates. File
+names start with the local time (`2026-11-12_15-58-22_Garden_Front_Camera.mp4`),
+so they sort by time in a file list. Home Assistant's **Media** panel shows `/media`
+by default, not `/config/media`; to browse the recordings there, add this to
+`configuration.yaml` and restart Home Assistant:
+
+```yaml
+homeassistant:
+  media_dirs:
+    local: /config/media
 ```
 
-Only two locations are auto-allowed with zero configuration: `media_dirs["local"]`
-(which on a Docker install defaults to `/media` — typically not bind-mounted to
-a host path, so anything written there is lost the moment the container is
-*recreated*, not just restarted) and `<config>/www/`. `/config` is guaranteed to
-be a real, host-persistent, already-bind-mounted directory on every HA install
-type (Docker, HAOS, Supervised, Core), and `www/` is served by HA at `/local/...`
-too, so recordings land somewhere durable and browsable with zero extra setup —
-no Docker volume, no `configuration.yaml` edit, no HACS dependency. If you'd
-rather store recordings elsewhere, add the target directory to
-`allowlist_external_dirs` in `configuration.yaml` yourself; the storage-path
-field is otherwise always resolved relative to `/config/www`.
+This setting is also needed for the `camera.record` fallback, which may only write
+to folders Home Assistant allows.
 
 ## Services
 

@@ -972,10 +972,9 @@ class TuyaMQTTBridge:
     async def _maybe_record(self, area: str, name: str, camera_entity_id: str | None) -> None:
         """Start a local recording if enabled — called only after a human has
         already been confirmed by AI, never on raw/unfiltered motion. Fired as a
-        background task, not awaited inline: start_recording() now pre-warms the
-        camera's stream for a few seconds before recording (see recording_helper.py
-        "Stream warm-up"), which must never delay the alert email that follows this
-        call at both call sites. start_recording() failures no longer swallowed silently:
+        background task, not awaited inline: start_recording() only returns once the
+        whole recording is written (see recording_helper.py "Recorder"), which must
+        never delay the alert email that follows this call at both call sites. start_recording() failures no longer swallowed silently:
         a None return triggers a tech alert so a stuck or broken camera stream is visible.
         """
         if not self._recording_enabled or not camera_entity_id:
