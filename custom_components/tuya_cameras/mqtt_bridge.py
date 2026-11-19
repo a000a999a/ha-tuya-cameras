@@ -55,7 +55,7 @@ RELOAD_SILENCE_CONN_S     = 7200   # 2 h CONNECTED-but-silent (i.e. the Tier-2 n
 RELOAD_COOLDOWN_S         = 6 * 3600   # don't auto-reload the same entry more than once per 6 h
 RELOAD_VERIFY_DELAY_S     = 900    # Tier 4: check 15 min after a reload whether messages resumed
 
-TECH_ALERT_COOLDOWN       = 1800   # suppress duplicate tech alerts for 30 min
+TECH_ALERT_REMINDER_S     = 7200   # resend ongoing problem alerts at most every 2 h
 
 # Snapshot retry schedule (2026-08-28: front-loaded from the old (0, 1, 3) — a fast-moving
 # subject is most likely to still be in frame in the first ~1-2s after processing begins,
@@ -154,7 +154,7 @@ class TuyaMQTTBridge:
         self._unknown_announced: set[str] = set()
         self._camera_refresh_task: asyncio.Task | None = None
         self._last_msg_at: float = time.monotonic()
-        self._last_tech_alert_at: float = 0.0
+        self._problem_episodes: dict[str, tuple[float, float]] = {}  # key → (start_at, last_sent_at)
         self._current_client: Any = None  # live paho client; None when disconnected
         self._last_healed_at: float = 0.0  # last time watchdog forced a reconnect to heal silence
         self._received_since_start: bool = False  # set True on first message this instance sees
@@ -182,6 +182,7 @@ class TuyaMQTTBridge:
                     await self._send_tech_alert(
                         "MQTT credentials unavailable",
                         "Could not fetch MQTT credentials from Tuya API. Bridge will retry automatically.",
+                        episode_key="mqtt_creds",
                     )
                     await asyncio.sleep(RETRY_DELAY_S)
                     continue
@@ -200,6 +201,7 @@ class TuyaMQTTBridge:
                     await self._send_tech_alert(
                         "MQTT connection failed",
                         "Could not connect to Tuya MQTT broker. Bridge will retry automatically.",
+                        episode_key="mqtt_connect",
                     )
                     await asyncio.sleep(RETRY_DELAY_S)
                     continue
@@ -217,6 +219,8 @@ class TuyaMQTTBridge:
                 client.on_disconnect = on_disconnect
                 self._current_client = client  # watchdog reads this to distinguish quiet vs broken
 
+                await self._clear_problem_episode("mqtt_creds")
+                await self._clear_problem_episode("mqtt_connect")
                 _LOGGER.info("MQTT bridge connected. Creds expire in %ds", expire_s)
 
                 # Wait for disconnect signal or credential expiry
@@ -1156,13 +1160,31 @@ class TuyaMQTTBridge:
             entities.update(area_cfg.get("tech", []))
         return list(entities)
 
-    async def _send_tech_alert(self, subject: str, detail: str) -> None:
-        """Send a tech alert email — rate-limited to once per 30 min."""
+    async def _send_tech_alert(
+        self, subject: str, detail: str, episode_key: str | None = None
+    ) -> None:
+        """Send a tech alert email with episode tracking.
+
+        episode_key groups repeated alerts into one ongoing episode: the first call
+        sends immediately; subsequent calls for the same key are suppressed until
+        TECH_ALERT_REMINDER_S has passed, at which point a "still ongoing" reminder
+        goes out. Call _clear_problem_episode(key) to close the episode and send a
+        recovery email. Without an episode_key, the subject itself is the key (so
+        identical one-off alerts still get the 2h cooldown, preventing floods).
+        """
+        key = episode_key or subject
         now = time.monotonic()
-        if now - self._last_tech_alert_at < TECH_ALERT_COOLDOWN:
-            _LOGGER.debug("Tech alert suppressed (rate-limit): %s", subject)
-            return
-        self._last_tech_alert_at = now
+        if key in self._problem_episodes:
+            start_at, last_sent_at = self._problem_episodes[key]
+            if now - last_sent_at < TECH_ALERT_REMINDER_S:
+                _LOGGER.debug("Tech alert suppressed (episode ongoing): %s", subject)
+                return
+            elapsed_h = (now - start_at) / 3600
+            subject = f"{subject} (ongoing {elapsed_h:.0f}h)"
+            detail = f"{detail}<br><br><i>Problem first detected {elapsed_h:.1f} h ago.</i>"
+        else:
+            start_at = now
+        self._problem_episodes[key] = (start_at, now)
         to = self._get_all_tech_recipients()
         if not to:
             _LOGGER.warning("Tech alert '%s' — no tech recipients configured", subject)
@@ -1176,6 +1198,27 @@ class TuyaMQTTBridge:
         )
         await send_email(self._hass, f"[HA Cameras] {subject}", body, to)
         _LOGGER.info("Tech alert sent: %s → %s", subject, to)
+
+    async def _clear_problem_episode(self, episode_key: str) -> None:
+        """Close an ongoing problem episode and send a recovery email if one was open."""
+        if episode_key not in self._problem_episodes:
+            return
+        start_at, _ = self._problem_episodes.pop(episode_key)
+        elapsed_h = (time.monotonic() - start_at) / 3600
+        subject = "Back online"
+        detail = f"The problem resolved after {elapsed_h:.1f} h. All systems normal."
+        to = self._get_all_tech_recipients()
+        if not to:
+            return
+        body = (
+            f"<html><body>"
+            f"<h2 style='color:#27ae60;'>{subject}</h2>"
+            f"<p>{detail}</p>"
+            f"<p style='color:#888;font-size:0.9em;'>Home Assistant / tuya_cameras</p>"
+            f"</body></html>"
+        )
+        await send_email(self._hass, f"[HA Cameras] {subject}", body, to)
+        _LOGGER.info("Recovery alert sent (%s, %.1fh) → %s", episode_key, elapsed_h, to)
 
     def _get_camera_states(self) -> dict[str, str]:
         """Return {camera_name: ha_state} for all cameras known to this bridge's coordinator."""
